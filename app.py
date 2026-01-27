@@ -233,15 +233,6 @@ st.download_button(
 )
 
 
-        # Download
-        csv_bytes = master.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            "⬇️ Master CSV indir",
-            data=csv_bytes,
-            file_name="nhanes_pre_post_master.csv",
-            mime="text/csv"
-        )
-
         # Optional: also show which columns exist in CBC if user wants
         with st.expander("CBC sütunlarının tamamını göster", expanded=False):
             st.write("Pre CBC columns:", list(pre_cbc.columns))
