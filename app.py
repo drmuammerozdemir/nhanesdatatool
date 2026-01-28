@@ -1,252 +1,447 @@
-# app.py
+# pages/2_Analysis.py
+import io
 import streamlit as st
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="NHANES XPT Batch Merge → CSV", layout="wide")
-st.title("NHANES Pre vs Post: Tek Seferde XPT Yükle → Birleştir → CSV")
+st.set_page_config(page_title="NHANES Analysis", layout="wide")
+st.title("NHANES Pre vs Post – Analiz (CSV)")
 
 st.write(
-    "Tüm .xpt dosyalarını **tek seferde** yükle. Uygulama dosya adlarına göre otomatik ayırır ve SEQN ile birleştirir."
+    "Pre ve Post CSV dosyalarını yükle. Otomatik olarak indeksleri (NLR/PLR/SII) hesaplar; "
+    "özet tabloya **etki büyüklüğü (Cliff’s δ)**, **% değişim**, **FDR düzeltilmiş p** ve "
+    "**CRP için log10 dönüşümü** opsiyonlarını ekler. Grafikler: jitter + medyan çizgisi + bracket p-etiketi."
 )
 
-# ----------------------------
+# ---------------------------
 # Helpers
-# ----------------------------
-def read_xpt(uploaded_file) -> pd.DataFrame:
-    """Read NHANES .XPT (SAS transport) file into pandas DataFrame."""
-    df = pd.read_sas(uploaded_file, format="xport", encoding="utf-8")
+# ---------------------------
+def robust_read_csv(uploaded_file) -> pd.DataFrame:
+    for enc in ["utf-8-sig", "utf-8", "cp1254", "latin1"]:
+        try:
+            return pd.read_csv(uploaded_file, encoding=enc)
+        except Exception:
+            uploaded_file.seek(0)
+            continue
+    raise ValueError("CSV okunamadı. Encoding uyumsuz olabilir.")
 
-    # bytes -> str
-    for col in df.columns:
-        if df[col].dtype == object:
-            df[col] = df[col].apply(
-                lambda x: x.decode("utf-8", "ignore") if isinstance(x, (bytes, bytearray)) else x
-            )
-
+def ensure_upper_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     df.columns = [str(c).upper() for c in df.columns]
     return df
 
-
-def pick_first_existing(dfs: dict, keys: list[str]) -> pd.DataFrame | None:
-    """Return first df from dfs dict whose key exists and df not None."""
-    for k in keys:
-        if k in dfs and dfs[k] is not None and not dfs[k].empty:
-            return dfs[k]
-    return None
-
-
-def merge_cycle(demo: pd.DataFrame, crp: pd.DataFrame, cbc: pd.DataFrame, period_label: str) -> pd.DataFrame:
-    for name, df in [("DEMO", demo), ("CRP", crp), ("CBC", cbc)]:
-        if df is None or df.empty:
-            raise ValueError(f"{name} dosyası bulunamadı/boş.")
-        if "SEQN" not in df.columns:
-            raise ValueError(f"{name} dosyasında SEQN yok.")
-
-    demo = demo.drop_duplicates(subset=["SEQN"])
-    crp = crp.drop_duplicates(subset=["SEQN"])
-    cbc = cbc.drop_duplicates(subset=["SEQN"])
-
-    merged = demo.merge(crp, on="SEQN", how="inner", suffixes=("", "_CRP"))
-    merged = merged.merge(cbc, on="SEQN", how="inner", suffixes=("", "_CBC"))
-    merged["PERIOD"] = period_label
-    return merged
-
-
-def find_crp_column(df: pd.DataFrame) -> str | None:
-    """Try to find CRP variable column name (usually LBXCRP)."""
-    candidates = ["LBXCRP", "LBDCRP", "CRP", "HSCRP", "LBXCRP_SI"]
+def find_first_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    cols = set(df.columns)
     for c in candidates:
-        if c in df.columns:
-            return c
-    # fallback: any column containing 'CRP'
-    for c in df.columns:
-        if "CRP" in c:
+        if c in cols:
             return c
     return None
 
-
-def normalize_file_key(name: str) -> str:
+def compute_indices(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Convert uploaded filename to a canonical key for matching.
-    Examples:
-      P_DEMO.xpt -> P_DEMO
-      DEMO_L.xpt -> DEMO_L
-      HSCRP_L.xpt -> HSCRP_L
+    Prefer absolute neutrophil/lymphocyte counts if present.
+    Fallback to percentages (LBXNEPCT / LBXLYPCT).
+    Creates: NLR, PLR, SII, INDEX_MODE
     """
-    base = name.rsplit(".", 1)[0]
-    return base.upper()
+    out = ensure_upper_cols(df.copy())
 
+    numeric_candidates = [
+        "LBXNEPCT", "LBXLYPCT", "LBXPLTSI", "LBXCRP", "RIDAGEYR",
+        "LBXNE", "LBXLY", "LBXNEUT", "LBXLYMPH", "LBXNEUTSI", "LBXLYMPSI"
+    ]
+    for c in numeric_candidates:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
 
-# ----------------------------
-# UI
-# ----------------------------
-uploaded = st.file_uploader(
-    "Tüm NHANES .xpt dosyalarını buraya tek seferde bırak (multi-upload)",
-    type=["xpt"],
-    accept_multiple_files=True
-)
+    neut_abs_col = find_first_col(out, ["LBXNE", "LBXNEUT", "LBXNEUTSI"])
+    lymph_abs_col = find_first_col(out, ["LBXLY", "LBXLYMPH", "LBXLYMPSI"])
 
-period_pre_label = st.text_input("Pre etiketi", value="Pre-pandemic (2017-2018)")
-period_post_label = st.text_input("Post etiketi", value="Post-pandemic (2021-2023)")
+    neut_pct_col = "LBXNEPCT" if "LBXNEPCT" in out.columns else None
+    lymph_pct_col = "LBXLYPCT" if "LBXLYPCT" in out.columns else None
 
-with st.expander("Opsiyonel filtreler", expanded=False):
-    apply_age_filter = st.checkbox("Sadece ≥18 yaş (RIDAGEYR varsa)", value=True)
-    apply_preg_excl = st.checkbox("Gebeleri hariç tut (RIDEXPRG varsa)", value=False)
+    if neut_abs_col and lymph_abs_col:
+        neut = out[neut_abs_col]
+        lymph = out[lymph_abs_col].replace(0, np.nan)
+        out["INDEX_MODE"] = "absolute"
+    else:
+        neut = out[neut_pct_col] if neut_pct_col else np.nan
+        lymph = out[lymph_pct_col].replace(0, np.nan) if lymph_pct_col else np.nan
+        out["INDEX_MODE"] = "percent"
 
-run = st.button("Birleştir ve CSV hazırla", type="primary")
+    if isinstance(neut, pd.Series) and isinstance(lymph, pd.Series):
+        out["NLR"] = neut / lymph
+        if "LBXPLTSI" in out.columns:
+            out["PLR"] = out["LBXPLTSI"] / lymph
+            out["SII"] = (out["LBXPLTSI"] * neut) / lymph
+        else:
+            out["PLR"] = np.nan
+            out["SII"] = np.nan
+    else:
+        out["NLR"] = np.nan
+        out["PLR"] = np.nan
+        out["SII"] = np.nan
 
-if uploaded:
-    st.markdown("### Yüklenen dosyalar")
-    st.write([f.name for f in uploaded])
+    return out
 
-if run:
+def median_iqr(series: pd.Series):
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty:
+        return np.nan, np.nan, np.nan
+    med = float(s.median())
+    q1 = float(s.quantile(0.25))
+    q3 = float(s.quantile(0.75))
+    return med, q1, q3
+
+def mann_whitney_u(x, y):
+    """Works with pandas Series or numpy arrays; returns (U, p)."""
     try:
-        if not uploaded:
-            raise ValueError("Önce .xpt dosyalarını yükle.")
+        from scipy.stats import mannwhitneyu
 
-        # Read all files into dict
-        with st.spinner("Dosyalar okunuyor..."):
-            dfs: dict[str, pd.DataFrame] = {}
-            for f in uploaded:
-                key = normalize_file_key(f.name)
-                dfs[key] = read_xpt(f)
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
 
-        # Expected keys (we accept both BIOPRO and HSCRP variants)
-        expected = {
-            "PRE":  ["P_DEMO", "P_CBC", "P_HSCRP", "P_BIOPRO"],
-            "POST": ["DEMO_L", "CBC_L", "HSCRP_L", "BIOPRO_L"]
-        }
+        x = x[np.isfinite(x)]
+        y = y[np.isfinite(y)]
 
-        st.markdown("### Otomatik eşleştirme sonucu")
-        pre_demo = pick_first_existing(dfs, ["P_DEMO"])
-        pre_cbc  = pick_first_existing(dfs, ["P_CBC"])
+        if x.size < 3 or y.size < 3:
+            return np.nan, np.nan
 
-        # CRP: prefer HSCRP, else BIOPRO
-        pre_crp  = pick_first_existing(dfs, ["P_HSCRP", "P_HSCRP", "P_BIOPRO"])
-        post_demo = pick_first_existing(dfs, ["DEMO_L"])
-        post_cbc  = pick_first_existing(dfs, ["CBC_L"])
-        post_crp  = pick_first_existing(dfs, ["HSCRP_L", "BIOPRO_L"])
+        stat, p = mannwhitneyu(x, y, alternative="two-sided")
+        return float(stat), float(p)
+    except Exception:
+        return np.nan, np.nan
 
-        # Show missing info
-        def present(k): return "✅" if (k in dfs and dfs[k] is not None and not dfs[k].empty) else "❌"
+def cliffs_delta(x, y, max_pairs: int = 2_000_000, seed: int = 42) -> float:
+    """
+    Cliff's delta effect size.
+    If nx*ny huge, subsample to keep it fast.
+    """
+    x = pd.to_numeric(pd.Series(x), errors="coerce").dropna().to_numpy(dtype=float)
+    y = pd.to_numeric(pd.Series(y), errors="coerce").dropna().to_numpy(dtype=float)
+    nx, ny = len(x), len(y)
+    if nx < 3 or ny < 3:
+        return np.nan
 
-        colA, colB = st.columns(2)
-        with colA:
-            st.write("**Pre (P_*)**")
-            st.write("P_DEMO:", present("P_DEMO"))
-            st.write("P_CBC:", present("P_CBC"))
-            st.write("P_HSCRP:", present("P_HSCRP") or present("P_HSCRP"))  # harmless
-            st.write("P_HSCRP / P_HSCRP:", "✅" if ("P_HSCRP" in dfs and not dfs["P_HSCRP"].empty) or ("P_HSCRP" in dfs and not dfs["P_HSCRP"].empty) else "❌")
-            st.write("P_BIOPRO (fallback):", present("P_BIOPRO"))
-        with colB:
-            st.write("**Post (*_L)**")
-            st.write("DEMO_L:", present("DEMO_L"))
-            st.write("CBC_L:", present("CBC_L"))
-            st.write("HSCRP_L:", present("HSCRP_L"))
-            st.write("BIOPRO_L (fallback):", present("BIOPRO_L"))
+    if nx * ny > max_pairs:
+        rng = np.random.default_rng(seed)
+        x = rng.choice(x, size=min(nx, 1500), replace=False)
+        y = rng.choice(y, size=min(ny, 1500), replace=False)
+        nx, ny = len(x), len(y)
 
-        if pre_demo is None or pre_cbc is None:
-            raise ValueError("Pre tarafında DEMO veya CBC eksik. (P_DEMO.xpt ve P_CBC.xpt gerekli)")
-        if post_demo is None or post_cbc is None:
-            raise ValueError("Post tarafında DEMO veya CBC eksik. (DEMO_L.xpt ve CBC_L.xpt gerekli)")
-        if pre_crp is None:
-            raise ValueError("Pre tarafında CRP dosyası yok. (P_HSCRP.xpt veya P_BIOPRO.xpt gerekli)")
-        if post_crp is None:
-            raise ValueError("Post tarafında CRP dosyası yok. (HSCRP_L.xpt veya BIOPRO_L.xpt gerekli)")
+    gt = 0
+    lt = 0
+    for xi in x:
+        gt += int(np.sum(xi > y))
+        lt += int(np.sum(xi < y))
+    return (gt - lt) / (nx * ny)
 
-        # Ensure CRP column exists
-        pre_crp_col = find_crp_column(pre_crp)
-        post_crp_col = find_crp_column(post_crp)
-        if pre_crp_col is None:
-            raise ValueError("Pre CRP dosyasında CRP değişkeni bulunamadı (LBXCRP beklenir).")
-        if post_crp_col is None:
-            raise ValueError("Post CRP dosyasında CRP değişkeni bulunamadı (LBXCRP beklenir).")
+def p_label(p: float) -> str:
+    """Clinical-style p reporting."""
+    if not np.isfinite(p):
+        return "NA"
+    if p < 0.001:
+        return "<0.001"
+    if p < 0.05:
+        return "<0.05"
+    return "NS"
 
-        # If column name differs, standardize to LBXCRP for downstream consistency
-        if pre_crp_col != "LBXCRP":
-            pre_crp = pre_crp.rename(columns={pre_crp_col: "LBXCRP"})
-        if post_crp_col != "LBXCRP":
-            post_crp = post_crp.rename(columns={post_crp_col: "LBXCRP"})
+def fdr_bh(pvals: np.ndarray) -> np.ndarray:
+    p = np.array(pvals, dtype=float)
+    out = np.full_like(p, np.nan, dtype=float)
+    mask = np.isfinite(p)
+    pv = p[mask]
+    m = pv.size
+    if m == 0:
+        return out
+    order = np.argsort(pv)
+    ranked = pv[order]
+    q = ranked * m / (np.arange(1, m + 1))
+    q = np.minimum.accumulate(q[::-1])[::-1]
+    out_vals = np.empty_like(ranked)
+    out_vals[order] = np.clip(q, 0, 1)
+    out[mask] = out_vals
+    return out
 
-        # Merge
-        with st.spinner("SEQN ile birleştiriliyor..."):
-            pre_merged = merge_cycle(pre_demo, pre_crp[["SEQN", "LBXCRP"]], pre_cbc, period_pre_label)
-            post_merged = merge_cycle(post_demo, post_crp[["SEQN", "LBXCRP"]], post_cbc, period_post_label)
+def format_med_iqr(med, q1, q3) -> str:
+    if np.isfinite(med):
+        return f"{med:.3g} [{q1:.3g}–{q3:.3g}]"
+    return "NA"
 
-        # Optional filters
-        def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
-            out = df.copy()
-            if apply_age_filter and "RIDAGEYR" in out.columns:
-                out = out[out["RIDAGEYR"].notna() & (out["RIDAGEYR"] >= 18)]
-            if apply_preg_excl and "RIDEXPRG" in out.columns:
-                out = out[~(out["RIDEXPRG"] == 1)]
-            return out
+def safe_n(series) -> int:
+    return int(pd.to_numeric(pd.Series(series), errors="coerce").dropna().shape[0])
 
-        pre_merged = apply_filters(pre_merged)
-        post_merged = apply_filters(post_merged)
+def stripplot_with_p(ax, data_groups, labels, p_text, title="", ylabel="", point_size=9):
+    """
+    Jitter scatter + median line + bracket + p label.
+    Horizontal thick line = MEDIAN.
+    """
+    x_positions = [1, 2]
 
-        st.success("✅ Birleştirme tamam! (Pre ve Post ayrı CSV)")
-      
-        c1, c2 = st.columns(2)
-        c1.metric("Pre satır", f"{len(pre_merged):,}")
-        c2.metric("Post satır", f"{len(post_merged):,}")
+    cleaned = []
+    for vals in data_groups:
+        v = pd.to_numeric(pd.Series(vals), errors="coerce").dropna().to_numpy(dtype=float)
+        cleaned.append(v)
 
-        # Pre preview + download
-        st.markdown("### Pre-pandemic örnek (ilk 20 satır)")
-        st.dataframe(pre_merged.head(20), use_container_width=True)
+    for i, vals in enumerate(cleaned):
+        x = np.random.normal(x_positions[i], 0.045, size=len(vals))
+        ax.scatter(x, vals, alpha=0.6, s=point_size)
 
-        pre_csv_bytes = pre_merged.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            "⬇️ Pre CSV indir",
-            data=pre_csv_bytes,
-            file_name="nhanes_pre_pandemic.csv",
-            mime="text/csv"
-        )
+        med = np.median(vals) if len(vals) else np.nan
+        if np.isfinite(med):
+            ax.hlines(med, x_positions[i]-0.22, x_positions[i]+0.22, linewidth=3)
 
-        st.divider()
+    # bracket height based on data range
+    y_max = max([v.max() if len(v) else 0 for v in cleaned])
+    y_min = min([v.min() if len(v) else 0 for v in cleaned])
+    yr = (y_max - y_min) if (y_max - y_min) > 0 else 1.0
+    h = yr * 0.08
 
-        # Post preview + download
-        st.markdown("### Post-pandemic örnek (ilk 20 satır)")
-        st.dataframe(post_merged.head(20), use_container_width=True)
+    ax.plot([1, 1, 2, 2], [y_max, y_max+h, y_max+h, y_max], lw=1.5)
+    ax.text(1.5, y_max + h*1.05, f"p {p_text}", ha="center", va="bottom")
 
-        post_csv_bytes = post_merged.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            "⬇️ Post CSV indir",
-            data=post_csv_bytes,
-            file_name="nhanes_post_pandemic.csv",
-            mime="text/csv"
-        )
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(labels)
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
 
+# ---------------------------
+# UI: Upload
+# ---------------------------
+col1, col2 = st.columns(2)
+with col1:
+    pre_file = st.file_uploader("Pre CSV (nhanes_pre_pandemic.csv)", type=["csv"], key="pre_csv")
+with col2:
+    post_file = st.file_uploader("Post CSV (nhanes_post_pandemic.csv)", type=["csv"], key="post_csv")
 
 st.divider()
 
-# Post preview + download
-st.markdown("### Post-pandemic örnek (ilk 20 satır)")
-st.dataframe(post_merged.head(20), use_container_width=True)
+if not pre_file or not post_file:
+    st.info("Devam etmek için iki CSV’yi de yükle.")
+    st.stop()
 
-post_csv_bytes = post_merged.to_csv(index=False).encode("utf-8-sig")
+pre = ensure_upper_cols(robust_read_csv(pre_file))
+post = ensure_upper_cols(robust_read_csv(post_file))
+
+if "PERIOD" not in pre.columns:
+    pre["PERIOD"] = "Pre"
+if "PERIOD" not in post.columns:
+    post["PERIOD"] = "Post"
+
+pre = compute_indices(pre)
+post = compute_indices(post)
+
+df = pd.concat([pre, post], ignore_index=True, sort=False)
+
+# ---------------------------
+# Sidebar filters & plot options
+# ---------------------------
+st.sidebar.header("Filtreler / Grafik ayarları")
+
+age_min = st.sidebar.number_input("Minimum yaş", value=18, min_value=0, max_value=120)
+age_max = st.sidebar.number_input("Maksimum yaş", value=120, min_value=0, max_value=120)
+
+exclude_crp_gt10 = st.sidebar.checkbox("CRP > 10 mg/L dışla (akut inflamasyon)", value=False)
+log_transform_crp = st.sidebar.checkbox("CRP için log10 dönüşümü oluştur (LBXCRP_LOG10)", value=True)
+
+point_size = st.sidebar.slider("Nokta boyutu (scatter)", min_value=3, max_value=25, value=9, step=1)
+dpi_out = st.sidebar.selectbox("İndirme DPI", options=[150, 300, 600], index=1)
+
+# Apply filters
+df_f = df.copy()
+
+if "RIDAGEYR" in df_f.columns:
+    df_f = df_f[
+        (df_f["RIDAGEYR"].notna()) &
+        (df_f["RIDAGEYR"] >= age_min) &
+        (df_f["RIDAGEYR"] <= age_max)
+    ]
+
+if exclude_crp_gt10 and "LBXCRP" in df_f.columns:
+    df_f = df_f[~(pd.to_numeric(df_f["LBXCRP"], errors="coerce") > 10)]
+
+if log_transform_crp and "LBXCRP" in df_f.columns:
+    crp_num = pd.to_numeric(df_f["LBXCRP"], errors="coerce").replace(0, np.nan)
+    df_f["LBXCRP_LOG10"] = np.log10(crp_num)
+
+pre_f = df_f[df_f["PERIOD"].str.contains("pre", case=False, na=False)].copy()
+post_f = df_f[df_f["PERIOD"].str.contains("post", case=False, na=False)].copy()
+
+mode_pre = pre_f["INDEX_MODE"].mode().iloc[0] if "INDEX_MODE" in pre_f.columns and not pre_f.empty else "NA"
+mode_post = post_f["INDEX_MODE"].mode().iloc[0] if "INDEX_MODE" in post_f.columns and not post_f.empty else "NA"
+st.caption(f"İndeks hesaplama modu: Pre = **{mode_pre}**, Post = **{mode_post}**")
+
+# ---------------------------
+# Variable selection
+# ---------------------------
+st.subheader("1) Değişken seçimi")
+
+default_vars = [c for c in [
+    "LBXCRP", "LBXCRP_LOG10", "NLR", "PLR", "SII",
+    "LBXWBCSI", "LBXNEPCT", "LBXLYPCT", "LBXPLTSI"
+] if c in df_f.columns]
+
+vars_to_analyze = st.multiselect(
+    "Analiz edilecek değişkenler",
+    options=sorted(df_f.columns),
+    default=default_vars
+)
+
+if not vars_to_analyze:
+    st.warning("En az bir değişken seç.")
+    st.stop()
+
+# ---------------------------
+# Summary table
+# ---------------------------
+st.subheader("2) Özet tablo (Median [IQR]) + Mann–Whitney U + Etki büyüklüğü + FDR")
+
+rows = []
+pvals_numeric = []
+
+for v in vars_to_analyze:
+    if v not in pre_f.columns or v not in post_f.columns:
+        rows.append({
+            "Variable": v,
+            "Pre Median [Q1–Q3]": "NA",
+            "Post Median [Q1–Q3]": "NA",
+            "%Δ (Post vs Pre)": "NA",
+            "Mann–Whitney U": "NA",
+            "p-value": "NA",
+            "Cliff's δ": "NA",
+            "n (Pre)": safe_n(pre_f[v]) if v in pre_f.columns else 0,
+            "n (Post)": safe_n(post_f[v]) if v in post_f.columns else 0,
+        })
+        pvals_numeric.append(np.nan)
+        continue
+
+    pre_med, pre_q1, pre_q3 = median_iqr(pre_f[v])
+    post_med, post_q1, post_q3 = median_iqr(post_f[v])
+
+    pct_change = np.nan
+    if np.isfinite(pre_med) and pre_med != 0 and np.isfinite(post_med):
+        pct_change = 100.0 * (post_med - pre_med) / pre_med
+
+    pre_vals_s = pd.to_numeric(pre_f[v], errors="coerce").dropna().to_numpy()
+    post_vals_s = pd.to_numeric(post_f[v], errors="coerce").dropna().to_numpy()
+
+    stat, p = mann_whitney_u(pre_vals_s, post_vals_s)
+    delta = cliffs_delta(pre_vals_s, post_vals_s)
+
+    rows.append({
+        "Variable": v,
+        "Pre Median [Q1–Q3]": format_med_iqr(pre_med, pre_q1, pre_q3),
+        "Post Median [Q1–Q3]": format_med_iqr(post_med, post_q1, post_q3),
+        "%Δ (Post vs Pre)": f"{pct_change:.1f}%" if np.isfinite(pct_change) else "NA",
+        "Mann–Whitney U": f"{stat:.3g}" if np.isfinite(stat) else "NA",
+        "p-value": p_label(p),
+        "Cliff's δ": f"{delta:.3f}" if np.isfinite(delta) else "NA",
+        "n (Pre)": safe_n(pre_vals_s),
+        "n (Post)": safe_n(post_vals_s),
+    })
+
+    pvals_numeric.append(p if np.isfinite(p) else np.nan)
+
+summary = pd.DataFrame(rows)
+
+# FDR correction (q-values) + label
+p_arr = pd.to_numeric(pd.Series(pvals_numeric), errors="coerce").values
+q_arr = fdr_bh(p_arr)
+summary["p_FDR"] = [p_label(q) for q in q_arr]
+
+st.dataframe(summary, use_container_width=True)
+
 st.download_button(
-    "⬇️ Post CSV indir",
-    data=post_csv_bytes,
-    file_name="nhanes_post_pandemic.csv",
+    "⬇️ Özet tabloyu CSV indir",
+    data=summary.to_csv(index=False).encode("utf-8-sig"),
+    file_name="nhanes_pre_post_summary_enhanced.csv",
     mime="text/csv"
 )
 
+# ---------------------------
+# Plots (single + multi grid)
+# ---------------------------
+st.subheader("3) Grafikler")
 
-        # Optional: also show which columns exist in CBC if user wants
-        with st.expander("CBC sütunlarının tamamını göster", expanded=False):
-            st.write("Pre CBC columns:", list(pre_cbc.columns))
-            st.write("Post CBC columns:", list(post_cbc.columns))
+# Single selector kept for convenience
+plot_var_single = st.selectbox("Tek grafik için değişken (opsiyonel)", vars_to_analyze)
 
-    except Exception as e:
-        st.error(f"Hata: {e}")
-
-st.divider()
-st.subheader("Lokal çalıştırma")
-st.code(
-"""pip install streamlit pandas pyreadstat
-streamlit run app.py
-""",
-language="bash"
+plot_vars = st.multiselect(
+    "Çoklu grafik için değişken(ler) (4 → 2x2, 9 → 3x3 otomatik)",
+    options=vars_to_analyze,
+    default=[plot_var_single] if plot_var_single in vars_to_analyze else vars_to_analyze[:4]
 )
 
+if not plot_vars:
+    st.info("Grafik için en az 1 değişken seç.")
+    st.stop()
+
+n = len(plot_vars)
+cols = int(np.ceil(np.sqrt(n)))
+rows = int(np.ceil(n / cols))
+
+fig, axes = plt.subplots(rows, cols, figsize=(cols * 4.2, rows * 4.2))
+axes = np.array(axes).reshape(-1)
+
+for i, v in enumerate(plot_vars):
+    ax = axes[i]
+
+    pre_vals = pd.to_numeric(pre_f[v], errors="coerce").dropna().to_numpy()
+    post_vals = pd.to_numeric(post_f[v], errors="coerce").dropna().to_numpy()
+
+    _, p_raw = mann_whitney_u(pre_vals, post_vals)
+    p_txt = p_label(p_raw)
+
+    stripplot_with_p(
+        ax=ax,
+        data_groups=[pre_vals, post_vals],
+        labels=["Pre", "Post"],
+        p_text=p_txt,
+        title=v,
+        ylabel=v,
+        point_size=point_size
+    )
+
+for j in range(i + 1, len(axes)):
+    axes[j].axis("off")
+
+plt.tight_layout()
+st.pyplot(fig, clear_figure=True)
+
+st.caption("Bilgi: Grafiklerdeki kalın yatay çizgi **medyanı** gösterir (ortalama değil).")
+
+# Download 300 DPI (or selected)
+buf = io.BytesIO()
+fig.savefig(buf, format="png", dpi=int(dpi_out), bbox_inches="tight")
+buf.seek(0)
+
+st.download_button(
+    f"⬇️ Grafik(ler)i indir (PNG, {dpi_out} DPI)",
+    data=buf,
+    file_name=f"nhanes_plots_{dpi_out}dpi.png",
+    mime="image/png"
+)
+
+# Optional histogram overlay for the single selected variable
+with st.expander("Histogram (tek değişken, opsiyonel)", expanded=False):
+    v = plot_var_single
+    pre_vals_h = pd.to_numeric(pre_f[v], errors="coerce").dropna().to_numpy()
+    post_vals_h = pd.to_numeric(post_f[v], errors="coerce").dropna().to_numpy()
+
+    fig2, ax2 = plt.subplots(figsize=(6, 4))
+    ax2.hist(pre_vals_h, bins=40, alpha=0.6, label="Pre")
+    ax2.hist(post_vals_h, bins=40, alpha=0.6, label="Post")
+    ax2.set_title(f"{v} dağılımı (Pre vs Post)")
+    ax2.set_xlabel(v)
+    ax2.set_ylabel("Count")
+    ax2.legend()
+    st.pyplot(fig2, clear_figure=True)
+
+st.markdown("### Filtrelenmiş veri örnekleri")
+cA, cB = st.columns(2)
+with cA:
+    st.write("Pre head")
+    st.dataframe(pre_f.head(10), use_container_width=True)
+with cB:
+    st.write("Post head")
+    st.dataframe(post_f.head(10), use_container_width=True)
