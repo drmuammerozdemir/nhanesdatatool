@@ -114,6 +114,26 @@ def cliffs_delta(x, y):
 # ---------------------------
 def compute_indices(df):
     out = df.copy()
+    # ==========================================
+    # ⬇️ BURAYA YAPIŞTIRIN (TANSİYON HESABI) ⬇️
+    # ==========================================
+    
+    # 0. TANSİYON VE NABIZ ORTALAMALARI (Yeni Ekleme)
+    # Önce sütunların veride olup olmadığını kontrol edip sayıya çevirelim
+    bp_cols = ['BPXOSY2', 'BPXOSY3', 'BPXODI2', 'BPXODI3', 'BPXOPLS2', 'BPXOPLS3']
+    for col in bp_cols:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors='coerce')
+
+    # Ortalamaları Hesaplama (Varsa hesapla, yoksa NaN bırak)
+    if 'BPXOSY2' in out.columns and 'BPXOSY3' in out.columns:
+        out['SYSTOLICBP'] = out[['BPXOSY2', 'BPXOSY3']].mean(axis=1, skipna=True)
+    
+    if 'BPXODI2' in out.columns and 'BPXODI3' in out.columns:
+        out['DIASTOLICBP'] = out[['BPXODI2', 'BPXODI3']].mean(axis=1, skipna=True)
+        
+    if 'BPXOPLS2' in out.columns and 'BPXOPLS3' in out.columns:
+        out['PULSEAVG'] = out[['BPXOPLS2', 'BPXOPLS3']].mean(axis=1, skipna=True)
     
     # 1. Sayısal Dönüşüm
     cols_to_numeric = [
@@ -125,13 +145,33 @@ def compute_indices(df):
             out[c] = pd.to_numeric(out[c], errors="coerce")
 
     # 2. İndeksler
+    # Mevcutlar:
+        # NLR
     if "NEUT_ABS" in out.columns and "LYMPH_ABS" in out.columns:
         out["NLR"] = out["NEUT_ABS"] / out["LYMPH_ABS"]
+        
+        # dNLR (Derived NLR) -> Formül: Nötrofil / (WBC - Nötrofil)
+        if "WBC" in out.columns:
+             # Paydanın 0 olmasını engellemek için küçük bir güvenlik önlemi alınabilir ama genelde gerekmez.
+             denom = out["WBC"] - out["NEUT_ABS"]
+             out["dNLR"] = out["NEUT_ABS"] / denom
+        
+        # SII ve PLR
         if "PLT" in out.columns:
             out["SII"] = (out["PLT"] * out["NEUT_ABS"]) / out["LYMPH_ABS"]
             out["PLR"] = out["PLT"] / out["LYMPH_ABS"]
+        # SIRI
         if "MONO_ABS" in out.columns:
             out["SIRI"] = (out["NEUT_ABS"] * out["MONO_ABS"]) / out["LYMPH_ABS"]
+            
+            # MLR (Monocyte to Lymphocyte Ratio)
+            out["MLR"] = out["MONO_ABS"] / out["LYMPH_ABS"]
+            
+            # NMLR (Neutrophil + Monocyte to Lymphocyte Ratio)
+            # Not: Eğer kastettiğiniz sadece Nötrofil/Monosit ise formülü: out["NEUT_ABS"] / out["MONO_ABS"] yapın.
+            out["NMLR"] = (out["NEUT_ABS"] + out["MONO_ABS"]) / out["LYMPH_ABS"]
+
+            # AISI
             if "PLT" in out.columns:
                 out["AISI"] = (out["NEUT_ABS"] * out["PLT"] * out["MONO_ABS"]) / out["LYMPH_ABS"]
 
@@ -206,7 +246,7 @@ if gender_filter == "Erkek (1)": df_f = df_f[df_f["SEX"] == 1]
 # Değişken Seçimi
 st.sidebar.markdown("---")
 st.sidebar.subheader("Değişkenler")
-default_vars = ["SII", "NLR", "PLR", "CRP", "WBC", "AGE", "BMI", "SMOKING_STATUS", "PACK_YEARS"]
+default_vars = ["SII", "NLR", "dNLR", "PLR", "MLR", "NMLR", "SYSTOLICBP", "DIASTOLICBP", "PULSEAVG", "CRP", "WBC", "AGE", "BMI", "WAIST_CM", "SMOKING_STATUS"]
 avail_vars = [c for c in default_vars if c in df_f.columns]
 all_cols = sorted(list(df_f.columns))
 
@@ -361,17 +401,203 @@ elif page == "3. Korelasyon":
         st.pyplot(fig)
 
 # =========================================================
-# SAYFA 4: REGRESYON
+# SAYFA 4: REGRESYON (GELİŞMİŞ & GÖRSELLEŞTİRMELİ)
 # =========================================================
 elif page == "4. Regresyon":
-    st.header("4. Regresyon")
-    target = st.selectbox("Y", ["SII", "NLR", "PLR"], 0)
-    covars = st.multiselect("X", ["PERIOD", "AGE", "SEX", "BMI", "SMOKING_STATUS"], default=["PERIOD", "AGE"])
+    st.header("4. Çok Değişkenli Doğrusal Regresyon (Multivariate Linear Regression)")
+    st.markdown("""
+    Bu modül, **En Küçük Kareler Yöntemi (OLS)** kullanarak bağımlı değişken (Y) üzerindeki etkileri analiz eder.
+    * **Hedef (Y):** Etkilenen değişken (Örn: SII, NLR).
+    * **Ana Faktör (X):** Asıl merak edilen etken (Örn: PERIOD).
+    * **Confounders:** Sonucu etkileyebilecek ve düzeltilmesi gereken yan faktörler (Örn: Yaş, Sigara, BMI).
+    """)
     
-    if st.button("Kur"):
+    st.markdown("---")
+    
+    # 1. DEĞİŞKEN SEÇİMİ (TAM ÖZGÜRLÜK)
+    # Sadece sayısal sütunları Y adayı yap, ama kullanıcı isterse hepsini görsün
+    numeric_candidates = df_f.select_dtypes(include=np.number).columns.tolist()
+    # Varsayılan olarak SII seçmeye çalış
+    default_ix = numeric_candidates.index("SII") if "SII" in numeric_candidates else 0
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        target = st.selectbox("1. Bağımlı Değişkeni Seçin (Y - Hedef)", 
+                              options=all_cols, # Tüm sütunlar
+                              index=all_cols.index("SII") if "SII" in all_cols else 0)
+        
+    with col2:
+        # Y seçildikten sonra kalanları listele
+        remaining_cols = [c for c in all_cols if c != target]
+        main_factor = st.selectbox("2. Ana Faktörü Seçin (X - İlgi Odağı)", 
+                                   options=remaining_cols,
+                                   index=remaining_cols.index("PERIOD") if "PERIOD" in remaining_cols else 0)
+
+    # Confounders Seçimi
+    confounder_candidates = [c for c in remaining_cols if c != main_factor]
+    default_confounders = [c for c in ["AGE", "SEX", "BMI", "SMOKING_STATUS", "RACE"] if c in confounder_candidates]
+    
+    confounders = st.multiselect("3. Düzeltme Faktörlerini Ekleyin (Confounders)", 
+                                 options=confounder_candidates,
+                                 default=default_confounders)
+
+    st.markdown("---")
+
+    if st.button("Regresyon Modelini Kur ve Çiz"):
+        # 1. FORMÜLÜ OLUŞTUR
+        # Patsy formülü: "SII ~ PERIOD + AGE + BMI..."
+        all_covars = [main_factor] + confounders
+        formula_str = f"{target} ~ {' + '.join(all_covars)}"
+        
+        st.info(f"**Kurulan Model:** `{formula_str}`")
+        
         try:
-            f = f"{target} ~ " + " + ".join(covars)
-            model = smf.ols(f, data=df_f.dropna(subset=[target]+covars)).fit()
-            st.code(model.summary().as_text())
+            # 2. VERİYİ HAZIRLA (Eksikleri At)
+            model_data = df_f[[target] + all_covars].dropna()
+            n_used = len(model_data)
+            
+            if n_used < 10:
+                st.error(f"Hata: Analiz için yeterli veri kalmadı (N={n_used}). Seçilen değişkenlerde çok fazla eksik (NaN) veri olabilir.")
+            else:
+                # 3. MODELİ ÇALIŞTIR
+                model = smf.ols(formula_str, data=model_data).fit()
+                
+                # 4. SONUÇ TABLOSU
+                st.subheader(f"📊 Model Sonuçları (N={n_used})")
+                st.code(model.summary().as_text())
+                
+                # 5. GRAFİK (FOREST PLOT / KATSAYI GRAFİĞİ)
+                st.subheader("📈 Katsayı Etki Grafiği (Forest Plot)")
+                st.caption("Nokta: Katsayı Değeri (Coef) | Çizgi: %95 Güven Aralığı. Çizgi 0 noktasını kesiyorsa sonuç anlamsızdır.")
+                
+                # Grafik verisini hazırla
+                err_series = model.conf_int()
+                err_series.columns = ['Lower', 'Upper']
+                err_series['Coef'] = model.params
+                
+                # Intercept genelde grafiği bozar, onu çıkarıyoruz
+                plot_data = err_series.drop("Intercept", errors="ignore")
+                
+                if not plot_data.empty:
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    
+                    # --- DÜZELTİLEN KISIM: MANUEL ÇİZİM DÖNGÜSÜ ---
+                    # errorbar yerine hlines ve plot kullanarak hatayı engelliyoruz
+                    
+                    # Y ekseni için pozisyonlar
+                    y_pos = range(len(plot_data))
+                    yticks = []
+                    yticklabels = []
+                    
+                    for i, (idx, row) in enumerate(plot_data.iterrows()):
+                        # Rengi belirle
+                        if row['Lower'] > 0: 
+                            c = 'firebrick'   # Pozitif ve Anlamlı (Kırmızı)
+                        elif row['Upper'] < 0: 
+                            c = 'steelblue'   # Negatif ve Anlamlı (Mavi)
+                        else: 
+                            c = 'gray'        # Anlamsız (Gri)
+                        
+                        # 1. Çizgiyi Çiz (Güven Aralığı)
+                        ax.hlines(y=i, xmin=row['Lower'], xmax=row['Upper'], color=c, linewidth=2)
+                        
+                        # 2. Noktayı Koy (Katsayı)
+                        ax.plot(row['Coef'], i, marker='o', color=c, markersize=8, markeredgecolor='black')
+                        
+                        # Etiketleri sakla
+                        yticks.append(i)
+                        yticklabels.append(idx)
+                    
+                    # Eksen Ayarları
+                    ax.set_yticks(yticks)
+                    ax.set_yticklabels(yticklabels)
+                    
+                    # 0 Noktasına Referans Çizgisi
+                    ax.axvline(x=0, color='black', linestyle='--', linewidth=1)
+                    
+                    ax.set_xlabel(f"{target} Change (Unit)")
+                    ax.set_title(f"Independent Effect of Factors on {target}")
+                    ax.grid(True, axis='x', linestyle=':', alpha=0.6)
+                    
+                    st.pyplot(fig)
+                    import io
+                    buf = io.BytesIO()
+                    # dpi=300: Baskı kalitesi (High Resolution)
+                    # bbox_inches='tight': Kenar boşluklarını otomatik kırpar
+                    fig.savefig(buf, format="png", dpi=300, bbox_inches='tight')
+                    
+                    st.download_button(
+                        label="📥 Grafiği İndir (300 DPI - PNG)",
+                        data=buf.getvalue(),
+                        file_name="grafik_yuksek_cozunurluk.png", # İsim değiştirebilirsiniz
+                        mime="image/png"
+                    )
+                else:
+                    st.warning("Grafik çizilecek katsayı bulunamadı (Sadece Intercept var).")
+                    
+# ... (Üst tarafta Forest Plot kodlarınız var) ...
+                
+                # --- YENİ EKLENECEK KISIM BAŞLANGICI: DÜZELTİLMİŞ ORTALAMALAR ---
+                st.markdown("---")
+                st.subheader("⚖️ Heterojenlik Düzeltmesi: Düzeltilmiş Ortalamalar (Adjusted Means)")
+                st.info(f"Aşağıdaki grafik, **{target}** üzerindeki demografik farkları (Irk, Yaş, Cinsiyet vb.) matematiksel olarak eşitleyerek **{main_factor}** değişkeninin 'saf' etkisini gösterir. Hakem eleştirisi için bu grafik kullanılır.")
+
+                # Sadece Ana Faktör Kategorik ise (Örn: PERIOD) bu grafiği çiz
+                # Eğer sayısal bir X seçtiyseniz (Örn: BMI) bu grafik mantıklı olmaz.
+                is_categorical_factor = (model_data[main_factor].dtype == 'object') or (len(model_data[main_factor].unique()) < 10)
+
+                if is_categorical_factor:
+                    # 1. Yapay Veri Seti Oluştur (Confounder'ları Sabitle)
+                    adj_data = model_data.copy()
+                    
+                    # Confounder'ları (Karıştırıcıları) ortalama veya mod değerine sabitle
+                    for c in confounders:
+                        if pd.api.types.is_numeric_dtype(adj_data[c]):
+                            mean_val = adj_data[c].mean()
+                            adj_data[c] = mean_val
+                        else:
+                            mode_val = adj_data[c].mode()[0]
+                            adj_data[c] = mode_val
+                    
+                    # 2. Ana Faktörün her seviyesi için tahmin yap
+                    levels = sorted(model_data[main_factor].unique())
+                    adj_means = []
+                    
+                    for lvl in levels:
+                        temp_df = adj_data.copy()
+                        temp_df[main_factor] = lvl # Herkesi bu gruba ata
+                        pred_mean = model.predict(temp_df).mean() # Tahmin et ve ortalamasını al
+                        adj_means.append(pred_mean)
+                    
+                    # 3. Bar Grafiği Çiz
+                    fig_adj, ax_adj = plt.subplots(figsize=(8, 6))
+                    # Renk paleti
+                    bar_colors = sns.color_palette("muted", len(levels))
+                    
+                    bars = ax_adj.bar(levels, adj_means, color=bar_colors, alpha=0.9, edgecolor='black')
+                    
+                    # Barların üzerine değerleri yaz
+                    for bar in bars:
+                        height = bar.get_height()
+                        ax_adj.text(bar.get_x() + bar.get_width()/2., height,
+                                    f'{height:.2f}',
+                                    ha='center', va='bottom', fontsize=12, fontweight='bold')
+
+                    ax_adj.set_ylabel(f"Düzeltilmiş {target} Ortalaması")
+                    ax_adj.set_xlabel(main_factor)
+                    ax_adj.set_title(f"Kovaryatlara Göre Düzeltilmiş Etki\n(Sabitlenenler: {', '.join(confounders)})")
+                    ax_adj.grid(axis='y', linestyle='--', alpha=0.5)
+                    
+                    st.pyplot(fig_adj)
+                    
+                    # Yorum
+                    diff = adj_means[-1] - adj_means[0]
+                    st.success(f"**Yorum:** Gruplar arasındaki demografik farklar (Irk, Yaş vb.) eşitlendiğinde bile, **{levels[-1]}** grubu **{levels[0]}** grubuna göre ortalama **{diff:.2f}** birim fark göstermektedir.")
+                
+                else:
+                    st.warning(f"Seçilen Ana Faktör ({main_factor}) sayısal olduğu için Düzeltilmiş Ortalama Bar Grafiği çizilmedi.")
+                # --- YENİ EKLENECEK KISIM BİTİŞİ ---
+
         except Exception as e:
-            st.error(str(e))
+            st.error(f"Model Hatası: {e}")
+            st.warning("İpucu: Seçilen değişkenlerin veri tiplerini kontrol edin. Sayısal olmayan veriler (String) modelde otomatik kategoriye çevrilir.")
