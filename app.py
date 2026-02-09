@@ -255,6 +255,11 @@ if st.sidebar.checkbox("Sadece SII verisi olanlar", True):
 else:
     df_f = df
 
+# --- EKLENEN CRP FİLTRESİ ---
+if "CRP" in df_f.columns:
+    if st.sidebar.checkbox("CRP > 10 olanları dışla (Enfeksiyon)", value=False):
+        df_f = df_f[df_f["CRP"] <= 10]
+
 gender_filter = st.sidebar.radio("Cinsiyet:", ["Tümü", "Kadın (2)", "Erkek (1)"])
 if gender_filter == "Kadın (2)": df_f = df_f[df_f["SEX"] == 2]
 if gender_filter == "Erkek (1)": df_f = df_f[df_f["SEX"] == 1]
@@ -563,8 +568,7 @@ elif page == "2. Grafikler":
         for i, v in enumerate(plot_vars):
             ax = axes[i]
             
-            # --- OUTLIER FİLTRELEME (Sadece Grafik İçin) ---
-            # Orijinal df_f bozulmaz, plot_data geçici oluşturulur
+            # --- OUTLIER FİLTRELEME ---
             plot_data = df_f.copy()
             
             if remove_outliers and pd.api.types.is_numeric_dtype(plot_data[v]):
@@ -572,15 +576,9 @@ elif page == "2. Grafikler":
                 Q3 = plot_data[v].quantile(0.75)
                 IQR = Q3 - Q1
                 upper_limit = Q3 + 1.5 * IQR
-                # Alt limit genelde biyolojik veride 0'dır ama yine de yazalım
                 lower_limit = Q1 - 1.5 * IQR
-                
-                # Filtrele
                 plot_data = plot_data[(plot_data[v] <= upper_limit) & (plot_data[v] >= lower_limit)]
-                
-                # Kaç veri atıldığını konsola veya başlığa yazabiliriz (Opsiyonel)
-                # st.write(f"{v}: {len(df_f) - len(plot_data)} aykırı değer gizlendi.")
-
+            
             # Kategorik kontrolü
             is_categorical = (v in forced_cat_vars) or (plot_data[v].dtype == 'object')
             
@@ -600,7 +598,7 @@ elif page == "2. Grafikler":
                     zorder=0      
                 )
 
-                # --- İSTATİSTİK HESABI ---
+                # --- İSTATİSTİK ÇİZGİLERİ (MEAN/MEDIAN) ---
                 periods = ["Pre", "Post"]
                 for j, period in enumerate(periods):
                     subset = plot_data[plot_data["PERIOD"] == period][v].dropna()
@@ -629,13 +627,56 @@ elif page == "2. Grafikler":
                         colors='black', linewidth=err_linewidth + 0.5, zorder=6
                     )
 
-                # --- LOG SCALE AYARI ---
-                if use_log:
-                    ax.set_yscale('log')
-                    # Logaritmik skalada 0 hatası olmasın diye minik bir değer ekleme gerekebilir
-                    # ama Seaborn genelde bunu handle eder. Ederse de etiketleri düzeltelim:
-                    from matplotlib.ticker import ScalarFormatter
-                    ax.yaxis.set_major_formatter(ScalarFormatter())
+                # ==================================================
+                # ⬇️ P-DEĞERİ VE BRACKET (TABLO İLE EŞİTLENDİ) ⬇️
+                # ==================================================
+                vec_pre = plot_data[plot_data["PERIOD"] == "Pre"][v].dropna()
+                vec_post = plot_data[plot_data["PERIOD"] == "Post"][v].dropna()
+
+                if len(vec_pre) > 1 and len(vec_post) > 1:
+                    # A) Tablodaki mantığın aynısı: Normallik Testi
+                    p_norm_check = check_normality(vec_pre)
+                    # Eğer test yapılamadıysa (nan) veya p > 0.05 ise Normal kabul edilebilir veya edilemez. 
+                    # Burada güvenli yol: p > 0.05 ise Normaldir.
+                    is_data_normal = p_norm_check > 0.05 if np.isfinite(p_norm_check) else False
+                    
+                    # B) Hangi Testi Kullanayım?
+                    # force_parametric işaretliyse VEYA veri normalse -> T-Test
+                    should_use_parametric = force_parametric or is_data_normal
+                    
+                    if should_use_parametric:
+                        _, p_val_plot = ttest_ind(vec_pre, vec_post, equal_var=False)
+                    else:
+                        _, p_val_plot = mannwhitneyu(vec_pre, vec_post)
+
+                    # Metin
+                    if p_val_plot < 0.001: p_txt = "p < 0.001"
+                    else: p_txt = f"p = {p_val_plot:.3f}"
+
+                    # Koordinatlar
+                    y_max_data = max(vec_pre.max(), vec_post.max())
+                    y_min_data = min(vec_pre.min(), vec_post.min())
+                    y_rng = y_max_data - y_min_data if y_max_data != y_min_data else y_max_data * 0.1
+                    
+                    bracket_h = y_max_data + (y_rng * 0.10) 
+                    text_h = bracket_h + (y_rng * 0.02)     
+                    tick_len = y_rng * 0.03                 
+
+                    # Çizim
+                    ax.plot([0, 0, 1, 1], [bracket_h - tick_len, bracket_h, bracket_h, bracket_h - tick_len], 
+                            lw=1.5, c='black')
+                    ax.text(0.5, text_h, p_txt, ha='center', va='bottom', fontsize=11, fontweight='bold', color='black')
+                    
+                    # Tavanı Yükselt
+                    current_ylim = ax.get_ylim()
+                    if text_h > current_ylim[1] or True: 
+                         ax.set_ylim(current_ylim[0], text_h + (y_rng * 0.15))
+
+            # --- LOG SCALE AYARI ---
+            if use_log:
+                ax.set_yscale('log')
+                from matplotlib.ticker import ScalarFormatter
+                ax.yaxis.set_major_formatter(ScalarFormatter())
 
             # --- ETİKETLER ---
             if len(plot_vars) == 1:
@@ -647,7 +688,7 @@ elif page == "2. Grafikler":
                 ax.set_xlabel("")
 
             # Temizlik
-            ax.grid(axis='y', linestyle='--', alpha=0.3, which='both') # Log için 'both'
+            ax.grid(axis='y', linestyle='--', alpha=0.3, which='both')
             ax.spines['top'].set_visible(False)
             ax.spines['right'].set_visible(False)
             ax.spines['left'].set_linewidth(1.5)
