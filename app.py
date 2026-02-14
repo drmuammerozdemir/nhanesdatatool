@@ -1387,48 +1387,54 @@ elif page == "4. Regression":
             st.warning("Please click 'Generate Table & Plot' again to update the table structure.")
 
     # ==========================================
-    # ⬇️ 5. DETAYLI MODEL İNCELEMESİ (SEASON CODE EKLENDİ) ⬇️
+    # ⬇️ 5. DETAYLI MODEL İNCELEMESİ (PRE REFERANS -> POST GÖSTERİMİ) ⬇️
     # ==========================================
     st.markdown("---")
     st.header("5. Detailed Factor Analysis")
     st.markdown("""
     Compare the effect size of **all variables** (Age, BMI, Sex, Season, etc.) for a single selected parameter.
+    **Note:** This model uses 'Pre-Pandemic' as the reference, showing the effect of the **Post-Pandemic** period.
     """)
 
-    # --- DEĞİŞİKLİK BURADA: Predictors Listesine SEASON_CODE Eklendi ---
+    # 1. Predictors Listesini Hazırla
     predictors = [main_factor] + confounders
     
-    # Eğer veride SEASON_CODE (Mevsim) varsa ve listeye zaten seçilmemişse, zorla ekle
+    # Eğer veride SEASON_CODE varsa ve seçilmemişse ekle
     if "SEASON_CODE" in df_f.columns and "SEASON_CODE" not in predictors:
         predictors.append("SEASON_CODE")
 
-    # 1. Hangi parametreye bakacağız?
+    # 2. Hangi parametreye bakacağız?
     if not targets:
         st.info("Please select at least one parameter above.")
     else:
-        # Default olarak listenin ilkini değil, boş gelmesini sağlayabiliriz veya ilkini seçebiliriz.
         detail_target = st.selectbox("🔍 Select Parameter to Inspect:", targets)
 
         if detail_target:
             # Model Verisi Hazırlama
             cols = [detail_target] + predictors
-            # Sadece ilgili sütunları alıp boş verileri atıyoruz
             model_data = df_f[cols].dropna()
             
             if len(model_data) > 30:
-                # Standart Sapma (Standardizasyon için)
                 y_std = model_data[detail_target].std()
                 
-                # Modeli Kur
-                formula = f"{detail_target} ~ {' + '.join(predictors)}"
+                # --- FORMÜL AYARI (KRİTİK KISIM) ---
+                # PERIOD değişkenini bulup, referansını 'Pre' yapıyoruz.
+                # Böylece sonuç 'Post' olarak çıkar.
+                formula_terms = []
+                for p in predictors:
+                    if p == "PERIOD":
+                        formula_terms.append("C(PERIOD, Treatment(reference='Pre'))")
+                    else:
+                        formula_terms.append(p)
+                
+                formula = f"{detail_target} ~ {' + '.join(formula_terms)}"
                 model = smf.ols(formula, data=model_data).fit()
                 
-                # Tüm Katsayıları Çek (Intercept hariç)
+                # --- VERİLERİ TOPLA ---
                 params = model.params.drop("Intercept", errors='ignore')
                 conf = model.conf_int().drop("Intercept", errors='ignore')
                 pvals = model.pvalues.drop("Intercept", errors='ignore')
                 
-                # Veriyi Tablo Haline Getir
                 detail_rows = []
                 for var_name in params.index:
                     coef = params[var_name]
@@ -1441,8 +1447,16 @@ elif page == "4. Regression":
                     else:
                         std_beta, lower, upper = 0, 0, 0
                     
+                    # --- İSİM TEMİZLEME (Grafik güzel görünsün) ---
+                    clean_name = var_name
+                    # Karmaşık statsmodels ismini sadeleştir: C(PERIOD, ...)[T.Post] -> PERIOD [Post]
+                    if "PERIOD" in var_name and "Post" in var_name:
+                        clean_name = "PERIOD [Post]"
+                    elif "SEASON_CODE" in var_name:
+                        clean_name = "SEASON"
+                    
                     detail_rows.append({
-                        "Faktör": var_name,
+                        "Faktör": clean_name, # Temiz isim
                         "Std. Beta": std_beta,
                         "Lower": lower,
                         "Upper": upper,
@@ -1451,29 +1465,25 @@ elif page == "4. Regression":
                 
                 df_detail = pd.DataFrame(detail_rows)
                 
-                # Sıralama: Etki gücüne (Mutlak değer) göre sırala
+                # Sıralama: Etki gücüne göre
                 df_detail["Abs_Effect"] = df_detail["Std. Beta"].abs()
                 df_detail = df_detail.sort_values("Abs_Effect", ascending=False)
                 
                 # --- GRAFİK ÇİZİMİ ---
                 fig_d, ax_d = plt.subplots(figsize=(8, len(df_detail) * 0.6 + 2))
-                
                 y_pos = range(len(df_detail))
                 
                 for i, (idx, row) in enumerate(df_detail.iterrows()):
-                    # Renk: P < 0.05 ise Kırmızı, değilse Gri
+                    # Renk ve Şeffaflık
                     c = '#d62728' if row["p-value"] < 0.05 else '#bdbdbd'
-                    # Şeffaflık
                     alpha = 1.0 if row["p-value"] < 0.05 else 0.5
                     
-                    # Hata Çubuğu ve Nokta
+                    # Çubuklar
                     ax_d.errorbar(x=row["Std. Beta"], y=i, 
                                   xerr=[[row["Std. Beta"] - row["Lower"]], [row["Upper"] - row["Std. Beta"]]],
                                   fmt='o', color=c, ecolor=c, capsize=4, elinewidth=2, alpha=alpha)
                     
                     # Değer Etiketi
-                    text_offset = 0.05 if row["Std. Beta"] >= 0 else -0.05
-                    
                     ax_d.text(row["Std. Beta"], i - 0.3, f"{row['Std. Beta']:.2f}", 
                               ha='center', va='center', fontsize=9, color=c, fontweight='bold')
 
@@ -1483,7 +1493,7 @@ elif page == "4. Regression":
                 ax_d.axvline(x=0, color='black', linestyle='--', linewidth=1)
                 
                 ax_d.set_xlabel("Standardized Effect Size (Beta / SD)", fontweight="bold")
-                ax_d.set_title(f"Determinants of {detail_target}\n(Relative Importance of Factors)", pad=10)
+                ax_d.set_title(f"Determinants of {detail_target}\n(Reference: Pre-Pandemic -> Effect of Post)", pad=10)
                 
                 # Temizlik
                 ax_d.spines['top'].set_visible(False)
@@ -1492,7 +1502,7 @@ elif page == "4. Regression":
                 
                 st.pyplot(fig_d)
                 
-                st.info(f"📌 **Interpretation:** This chart shows what drives **{detail_target}** the most. Red bars are statistically significant.")
+                st.info(f"📌 **Interpretation:** This chart shows what drives **{detail_target}**. The **PERIOD [Post]** bar specifically shows how the Post-Pandemic era differs from the Pre-Pandemic era.")
                 # =========================================================
                 # YENİ EKLENTİ: MODEL VARSAYIM KONTROLLERİ (DIAGNOSTICS)
                 # =========================================================
