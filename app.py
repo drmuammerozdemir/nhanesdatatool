@@ -4,7 +4,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.stats import shapiro, ttest_ind, mannwhitneyu, chi2_contingency
+from scipy.stats import shapiro, ttest_ind, mannwhitneyu, chi2_contingency, pearsonr, spearmanr, kendalltau
 import statsmodels.formula.api as smf
 import seaborn as sns
 
@@ -148,6 +148,12 @@ def compute_indices(df):
         if "WBC" in out.columns:
              denom = out["WBC"] - out["NEUT_ABS"]
              out["dNLR"] = out["NEUT_ABS"] / denom
+             
+             # --- YENİ EKLENEN: dPLR ---
+             # Formül: PLT / (WBC - NEUT)
+             # (WBC - NEUT), lenfosit yerine "derived" payda olarak kullanılır.
+             if "PLT" in out.columns:
+                 out["dPLR"] = out["PLT"] / denom    
         
         if "PLT" in out.columns:
             out["SII"] = (out["PLT"] * out["NEUT_ABS"]) / out["LYMPH_ABS"]
@@ -314,7 +320,7 @@ if only_adults and "AGE" in df_f.columns:
         })
 
 # --- 3. EKSİK VERİ FİLTRESİ ---
-sii_filter = st.sidebar.checkbox("Exclude Missing SII Data", value=True)
+sii_filter = st.sidebar.checkbox("Exclude Missing CBC Data", value=True)
 
 if sii_filter and "SII" in df_f.columns:
     n_before = len(df_f)
@@ -324,12 +330,48 @@ if sii_filter and "SII" in df_f.columns:
     if loss > 0:
         node_counter += 1
         steps.append({
-            "label": "Excluded (Missing Data)",
+            "label": "Excluded (Missing Data: CBC)",
             "loss_n": loss,
             "stats": get_stats_str(df_f),
             "id": node_counter
         })
+# =========================================================
+# YENİ EKLENTİ: BMI ve SMOKING EKSİK VERİ FİLTRELERİ
+# =========================================================
 
+# --- 3.1. BMI EKSİK VERİ FİLTRESİ ---
+if "BMI" in df_f.columns:
+    # Default True yaptık ki regresyonla sayı tutsun
+    if st.sidebar.checkbox("Exclude Missing Data: BMI", value=True):
+        n_before = len(df_f)
+        df_f = df_f.dropna(subset=["BMI"])
+        loss = n_before - len(df_f)
+        
+        if loss > 0:
+            node_counter += 1
+            steps.append({
+                "label": "Excluded (Missing Data: BMI)",
+                "loss_n": loss,
+                "stats": get_stats_str(df_f),
+                "id": node_counter
+            })
+
+# --- 3.2. SMOKING EKSİK VERİ FİLTRESİ ---
+if "SMOKING_STATUS" in df_f.columns:
+    # Default True yaptık
+    if st.sidebar.checkbox("Exclude Missing Data: Smoking", value=True):
+        n_before = len(df_f)
+        df_f = df_f.dropna(subset=["SMOKING_STATUS"])
+        loss = n_before - len(df_f)
+        
+        if loss > 0:
+            node_counter += 1
+            steps.append({
+                "label": "Excluded (Missing Data: Smoking)",
+                "loss_n": loss,
+                "stats": get_stats_str(df_f),
+                "id": node_counter
+            })
 # --- 4. CRP FİLTRESİ ---
 if "CRP" in df_f.columns:
     if st.sidebar.checkbox("Exclude Active Infection (CRP > 10)", value=False):
@@ -416,7 +458,7 @@ with st.sidebar.expander("📊 Study Flowchart", expanded=True):
 # Değişken Seçimi
 st.sidebar.markdown("---")
 st.sidebar.subheader("Variables")
-default_vars = ["SII", "NLR", "dNLR", "PLR", "MLR", "NMLR", "SYSTOLICBP", "DIASTOLICBP", "PULSEAVG", "CRP", "WBC", "AGE", "BMI", "WAIST_CM", "SMOKING_STATUS"]
+default_vars = ["SII", "NLR", "dNLR", "PLR", "dPLR", "MLR", "NMLR", "SYSTOLICBP", "DIASTOLICBP", "PULSEAVG", "CRP", "WBC", "AGE", "BMI", "WAIST_CM", "SMOKING_STATUS"]
 avail_vars = [c for c in default_vars if c in df_f.columns]
 all_cols = sorted(list(df_f.columns))
 
@@ -990,6 +1032,113 @@ elif page == "3. Correlation":
                 mime="image/png",
                 use_container_width=True
             )
+            # ---------------------------------------------------------
+    # 2. HEATMAP: R ve P DEĞERLERİ BİR ARADA
+    # ---------------------------------------------------------
+    st.markdown("---")
+    st.subheader(f"Detailed Heatmap ({corr_method.capitalize()} + P-Values)")
+    st.info("Visual representation where color indicates strength (r), and text shows significance (p).")
+
+    # Yazı boyutu ayarı (Bu grafik daha yoğun olacağı için)
+    col_h1, col_h2 = st.columns(2)
+    with col_h1:
+        p_font_size = st.slider("Text Size", 6, 20, 9, key="p_font")
+    with col_h2:
+        fig_h_height = st.slider("Height", 6, 30, 12, key="p_height")
+
+    # --- HESAPLAMA (R ve P Matrislerini Oluştur) ---
+    def get_annotated_matrix(df, method):
+        cols = df.columns
+        # 1. R Matrisi (Renkler için sayısal)
+        r_matrix = pd.DataFrame(index=cols, columns=cols, dtype=float)
+        # 2. Text Matrisi (Görünecek yazı için string)
+        text_matrix = pd.DataFrame(index=cols, columns=cols, dtype=object)
+        
+        for c1 in cols:
+            for c2 in cols:
+                # Köşegen (Kendisiyle ilişkisi)
+                if c1 == c2:
+                    r_matrix.loc[c1, c2] = 1.0
+                    text_matrix.loc[c1, c2] = "1.0\n(-)"
+                    continue
+                
+                # Veri temizliği
+                valid_data = df[[c1, c2]].dropna()
+                if len(valid_data) < 2:
+                    r_matrix.loc[c1, c2] = np.nan
+                    text_matrix.loc[c1, c2] = "NA"
+                    continue
+
+                # Hesaplama
+                if method == 'pearson':
+                    r, p = pearsonr(valid_data[c1], valid_data[c2])
+                elif method == 'spearman':
+                    r, p = spearmanr(valid_data[c1], valid_data[c2])
+                elif method == 'kendall':
+                    r, p = kendalltau(valid_data[c1], valid_data[c2])
+                else:
+                    r, p = np.nan, np.nan
+                
+                # Matrislere işle
+                r_matrix.loc[c1, c2] = r
+                
+                # P formatı
+                p_str = "<0.001" if p < 0.001 else f"{p:.3f}"
+                star = "*" if p < 0.05 else ""
+                
+                # Kutu içinde görünecek yazı:
+                # 0.54*
+                # (p=0.02)
+                text_matrix.loc[c1, c2] = f"{r:.2f}{star}\n(p={p_str})"
+        
+        return r_matrix, text_matrix
+
+    # Hesaplamayı Başlat
+    if len(num_cols) > 1:
+        r_data, text_data = get_annotated_matrix(df_f[num_cols], corr_method)
+
+        # Çizim
+        fig2, ax2 = plt.subplots(figsize=(fig_width, fig_h_height))
+        
+        # Maskeleme (Yukarıdaki ayarı miras alır)
+        mask_map = None
+        if mask_upper:
+            mask_map = np.triu(np.ones_like(r_data, dtype=bool))
+
+        sns.heatmap(
+            r_data.astype(float),       # Renkler buradan gelir
+            annot=text_data.values,     # Yazılar buradan gelir
+            fmt="",                     # String formatı (Hata almamak için boş bırakılır)
+            cmap=cmap_choice,
+            ax=ax2,
+            mask=mask_map,
+            annot_kws={"size": p_font_size, "weight": "normal"},
+            linewidths=0.5,
+            linecolor='white',
+            cbar_kws={"shrink": 0.8},
+            vmin=-1, vmax=1,
+            center=0
+        )
+
+        plt.xticks(rotation=45, ha='right', fontsize=p_font_size+2)
+        plt.yticks(rotation=0, fontsize=p_font_size+2)
+        plt.title(f"Correlation Analysis with P-Values", fontsize=p_font_size+4, fontweight='bold')
+        
+        st.pyplot(fig2)
+
+        # İndirme Butonu
+        col_d1, col_d2 = st.columns([3, 1])
+        with col_d2:
+            import io
+            buf2 = io.BytesIO()
+            fig2.savefig(buf2, format="png", dpi=300, bbox_inches='tight', transparent=True)
+            st.download_button(
+                label="📥 İndir (P-Value Heatmap)", 
+                data=buf2.getvalue(), 
+                file_name=f"heatmap_pvalues_{corr_method}.png", 
+                mime="image/png",
+                use_container_width=True
+            )
 
 # =========================================================
 # SAYFA 4: KOMPAKT ÇOKLU REGRESYON (STANDARDIZE GÖRSEL SEÇENEĞİ)
@@ -1010,7 +1159,7 @@ elif page == "4. Regression":
     # Sizin belirlediğiniz öncelikli liste
     wanted_defaults = [
         "WBC", "NEUT_ABS", "LYMPH_ABS", "MONO_ABS", "PLT", "MPV", 
-        "SII", "SIRI", "NLR", "dNLR", "PLR", "MLR", "NMLR", "AISI"
+        "SII", "SIRI", "NLR", "dNLR", "PLR", "dPLR", "MLR", "NMLR", "AISI", "CRP",
     ]
     
     # Bu listedekilerden, sadece yüklenen dosyada mevcut olanları seç (Hata almamak için)
@@ -1031,6 +1180,40 @@ elif page == "4. Regression":
     confounders = st.multiselect("3. Adjust for (Confounders):", 
                                  options=[c for c in remaining if c != main_factor],
                                  default=avail_conf)
+    
+    # ---------------------------------------------------------
+    # EKLENTİ: VERİ KAYBI ANALİZİ (Regresyon öncesi kontrol)
+    # ---------------------------------------------------------
+    if targets:
+        # 1. Analize girecek tüm sütunları topla
+        all_model_vars = targets + [main_factor] + confounders
+        
+        # 2. Bu sütunlarda eksik verisi olanları say
+        # Mevcut (Flowchart sonrası) veri sayısı
+        n_start = len(df_f)
+        
+        # Sadece seçilen değişkenler için temiz veri sayısı
+        df_clean = df_f[all_model_vars].dropna()
+        n_end = len(df_clean)
+        n_lost = n_start - n_end
+
+        # 3. Kullanıcıya Bilgi Ver
+        if n_lost > 0:
+            st.warning(f"⚠️ **Note on Sample Size:**")
+            st.markdown(f"""
+            * **Flowchart Data:** {n_start}
+            * **Regression Data:** {n_end} 
+            * **Dropped due to missing values:** {n_lost} participants
+            """)
+            
+            # Hangi değişkende ne kadar boş var? (Detay)
+            with st.expander("🕵️ Which variable is causing data loss?"):
+                missing_counts = df_f[all_model_vars].isnull().sum().sort_values(ascending=False)
+                missing_counts = missing_counts[missing_counts > 0]
+                if not missing_counts.empty:
+                    st.dataframe(missing_counts.rename("Missing Count"), use_container_width=True)
+                else:
+                    st.write("Data is clean, loss might be due to combined filtering.")
     
     st.markdown("---")
 
@@ -1157,7 +1340,7 @@ elif page == "4. Regression":
             # Grafik Verisi
             plot_df = df_res.iloc[::-1]
             
-            fig, ax = plt.subplots(figsize=(8, len(plot_df)*0.8 + 2))
+            fig, ax = plt.subplots(figsize=(8, len(plot_df)*0.5 + 2))
             y_pos = range(len(plot_df))
             
             for i, (idx, row) in enumerate(plot_df.iterrows()):
@@ -1310,6 +1493,79 @@ elif page == "4. Regression":
                 st.pyplot(fig_d)
                 
                 st.info(f"📌 **Interpretation:** This chart shows what drives **{detail_target}** the most. Red bars are statistically significant.")
+                # =========================================================
+                # YENİ EKLENTİ: MODEL VARSAYIM KONTROLLERİ (DIAGNOSTICS)
+                # =========================================================
+                st.markdown("---")
+                st.subheader("6. Model Diagnostics & Assumptions")
                 
+                diag_tab1, diag_tab2 = st.tabs(["⚠️ Multicollinearity (VIF)", "📉 Residual Analysis"])
+                
+                # --- 1. ÇOKLU BAĞLANTI (VIF) KONTROLÜ ---
+                with diag_tab1:
+                    st.markdown("**Assumption:** No Multicollinearity (VIF should be < 5 or 10)")
+                    
+                    # VIF Hesaplama için statsmodels kütüphanesi gerekir
+                    from statsmodels.stats.outliers_influence import variance_inflation_factor
+                    
+                    # Model verisinden sadece X'leri (bağımsız değişkenleri) al
+                    # Intercept (Sabit terim) statsmodels formülünde otomatik eklenir ama VIF için manuel dummyler gerekebilir.
+                    # Burada en temiz yol: model.model.exog matrisini kullanmaktır.
+                    
+                    exog = model.model.exog
+                    exog_names = model.model.exog_names
+                    
+                    vif_data = []
+                    for i in range(exog.shape[1]):
+                        # Intercept genelde ilk sütundur, VIF'i sonsuz çıkabilir, onu atlayabiliriz veya gösterebiliriz.
+                        if exog_names[i] == "Intercept": continue
+                            
+                        vif_val = variance_inflation_factor(exog, i)
+                        vif_data.append({"Variable": exog_names[i], "VIF": vif_val})
+                    
+                    vif_df = pd.DataFrame(vif_data).sort_values("VIF", ascending=False)
+                    
+                    col_v1, col_v2 = st.columns([1, 2])
+                    with col_v1:
+                        st.dataframe(vif_df, use_container_width=True, hide_index=True)
+                    
+                    with col_v2:
+                        # Yorum
+                        high_vif = vif_df[vif_df["VIF"] > 5]
+                        if not high_vif.empty:
+                            st.error(f"⚠️ **Warning:** High Multicollinearity detected in: {', '.join(high_vif['Variable'].tolist())}. Consider removing one of them.")
+                        else:
+                            st.success("✅ **Pass:** All variables have VIF < 5. No multicollinearity issues.")
+
+                # --- 2. NORMALLİK VE EŞVARYANSLILIK (RESIDUALS) ---
+                with diag_tab2:
+                    residuals = model.resid
+                    fitted = model.fittedvalues
+                    
+                    st.markdown("**Assumptions:** Normality of Residuals & Homoscedasticity")
+                    
+                    fig_res, (ax_r1, ax_r2) = plt.subplots(1, 2, figsize=(12, 5))
+                    
+                    # A) Residuals vs Fitted (Homoscedasticity)
+                    # Huni şekli olmamalı, rastgele dağılmalı
+                    sns.scatterplot(x=fitted, y=residuals, ax=ax_r1, alpha=0.5)
+                    ax_r1.axhline(0, color='red', linestyle='--')
+                    ax_r1.set_title("Residuals vs Fitted\n(Check for Homoscedasticity)")
+                    ax_r1.set_xlabel("Fitted Values")
+                    ax_r1.set_ylabel("Residuals")
+                    
+                    # B) Histogram & Q-Q Plot (Normality)
+                    from scipy.stats import probplot
+                    probplot(residuals, dist="norm", plot=ax_r2)
+                    ax_r2.set_title("Q-Q Plot\n(Check for Normality)")
+                    
+                    st.pyplot(fig_res)
+                    
+                    st.caption("""
+                    * **Left Plot:** Points should be randomly scattered around the red line (No funnel shape).
+                    * **Right Plot:** Points should follow the red line (Normality). 
+                    * *Note:* In large samples (N > 1000), slight deviations from normality are acceptable (Central Limit Theorem).
+                    """)
+                    
             else:
                 st.warning("Not enough data for this analysis.")
