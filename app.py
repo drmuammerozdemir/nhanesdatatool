@@ -20,18 +20,20 @@ RENAME_MAP = {
     # --- DEMOGRAFİ ---
     "RIDAGEYR": "AGE", "RIAGENDR": "SEX", "RIDRETH3": "RACE",
     "INDFMPIR": "PIR", "PERIOD": "PERIOD",
+    "RIDEXMON": "SEASON_CODE",  # Mevsim
+    "RIDEXPRG": "PREGNANCY",    # Hamilelik
     # --- VÜCUT ÖLÇÜMLERİ ---
     "BMXWT": "WEIGHT_KG", "BMXHT": "HEIGHT_CM", "BMXBMI": "BMI",
     "BMXWAIST": "WAIST_CM", "BMXHIP": "HIP_CM",
     # --- SİGARA DEĞİŞKENLERİ ---
-    "SMQ020": "SMOKE_LIFE_100",   
-    "SMQ040": "SMOKE_NOW",        
-    "SMD030": "AGE_STARTED",      
+    "SMQ020": "SMOKE_LIFE_100",    
+    "SMQ040": "SMOKE_NOW",          
+    "SMD030": "AGE_STARTED",       
     "SMD650": "CIGS_PER_DAY_NOW", 
     "SMD057": "CIGS_PER_DAY_QUIT",
     "SMQ050Q": "TIME_SINCE_QUIT", 
     "SMQ050U": "UNIT_SINCE_QUIT", 
-    "SMD630": "AGE_FIRST_CIG",    
+    "SMD630": "AGE_FIRST_CIG",     
     # --- LAB DEĞERLERİ ---
     "LBXWBCSI": "WBC", "LBXLYPCT": "LYMPH_PCT", "LBXMOPCT": "MONO_PCT",
     "LBXNEPCT": "NEUT_PCT", "LBXEOPCT": "EOS_PCT", "LBXBAPCT": "BASO_PCT",
@@ -114,18 +116,13 @@ def cliffs_delta(x, y):
 # ---------------------------
 def compute_indices(df):
     out = df.copy()
-    # ==========================================
-    # ⬇️ BURAYA YAPIŞTIRIN (TANSİYON HESABI) ⬇️
-    # ==========================================
     
-    # 0. TANSİYON VE NABIZ ORTALAMALARI (Yeni Ekleme)
-    # Önce sütunların veride olup olmadığını kontrol edip sayıya çevirelim
+    # 0. TANSİYON VE NABIZ ORTALAMALARI
     bp_cols = ['BPXOSY2', 'BPXOSY3', 'BPXODI2', 'BPXODI3', 'BPXOPLS2', 'BPXOPLS3']
     for col in bp_cols:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors='coerce')
 
-    # Ortalamaları Hesaplama (Varsa hesapla, yoksa NaN bırak)
     if 'BPXOSY2' in out.columns and 'BPXOSY3' in out.columns:
         out['SYSTOLICBP'] = out[['BPXOSY2', 'BPXOSY3']].mean(axis=1, skipna=True)
     
@@ -138,40 +135,29 @@ def compute_indices(df):
     # 1. Sayısal Dönüşüm
     cols_to_numeric = [
         "NEUT_ABS", "LYMPH_ABS", "MONO_ABS", "PLT", "WBC", "CRP",
-        "AGE", "AGE_STARTED", "AGE_FIRST_CIG", "CIGS_PER_DAY_NOW", "SMOKE_LIFE_100", "SMOKE_NOW"
+        "AGE", "AGE_STARTED", "AGE_FIRST_CIG", "CIGS_PER_DAY_NOW", "SMOKE_LIFE_100", "SMOKE_NOW", "PREGNANCY"
     ]
     for c in cols_to_numeric:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
 
     # 2. İndeksler
-    # Mevcutlar:
-        # NLR
     if "NEUT_ABS" in out.columns and "LYMPH_ABS" in out.columns:
         out["NLR"] = out["NEUT_ABS"] / out["LYMPH_ABS"]
         
-        # dNLR (Derived NLR) -> Formül: Nötrofil / (WBC - Nötrofil)
         if "WBC" in out.columns:
-             # Paydanın 0 olmasını engellemek için küçük bir güvenlik önlemi alınabilir ama genelde gerekmez.
              denom = out["WBC"] - out["NEUT_ABS"]
              out["dNLR"] = out["NEUT_ABS"] / denom
         
-        # SII ve PLR
         if "PLT" in out.columns:
             out["SII"] = (out["PLT"] * out["NEUT_ABS"]) / out["LYMPH_ABS"]
             out["PLR"] = out["PLT"] / out["LYMPH_ABS"]
-        # SIRI
+        
         if "MONO_ABS" in out.columns:
             out["SIRI"] = (out["NEUT_ABS"] * out["MONO_ABS"]) / out["LYMPH_ABS"]
-            
-            # MLR (Monocyte to Lymphocyte Ratio)
             out["MLR"] = out["MONO_ABS"] / out["LYMPH_ABS"]
-            
-            # NMLR (Neutrophil + Monocyte to Lymphocyte Ratio)
-            # Not: Eğer kastettiğiniz sadece Nötrofil/Monosit ise formülü: out["NEUT_ABS"] / out["MONO_ABS"] yapın.
             out["NMLR"] = (out["NEUT_ABS"] + out["MONO_ABS"]) / out["LYMPH_ABS"]
 
-            # AISI
             if "PLT" in out.columns:
                 out["AISI"] = (out["NEUT_ABS"] * out["PLT"] * out["MONO_ABS"]) / out["LYMPH_ABS"]
 
@@ -192,7 +178,6 @@ def compute_indices(df):
         age = out["AGE"]
         cigs = out["CIGS_PER_DAY_NOW"].replace({999: np.nan, 777: np.nan})
         
-        # Başlama Yaşı (Yedekli)
         start = pd.Series(np.nan, index=out.index)
         if "AGE_STARTED" in out.columns: start = start.fillna(out["AGE_STARTED"])
         if "AGE_FIRST_CIG" in out.columns: start = start.fillna(out["AGE_FIRST_CIG"])
@@ -203,11 +188,9 @@ def compute_indices(df):
         
         mask = (out["SMOKING_STATUS"] == "Current Smoker")
         out.loc[mask, "PACK_YEARS"] = py[mask]
-    # ==========================================
-    # ⬇️ IRK ETİKETLEME (BURAYA YAPIŞTIRIN) ⬇️
-    # ==========================================
+    
+    # IRK ETİKETLEME
     if "RACE" in out.columns:
-        # NHANES RIDRETH3 Kodları
         race_mapping = {
             1: "Mexican American",
             2: "Other Hispanic",
@@ -216,7 +199,6 @@ def compute_indices(df):
             6: "Non-Hispanic Asian",
             7: "Other/Multi-Racial"
         }
-        # Sadece sütun sayısal ise çevir (Hata almamak için)
         if pd.api.types.is_numeric_dtype(out["RACE"]):
              out["RACE"] = out["RACE"].map(race_mapping)
 
@@ -244,46 +226,218 @@ post = compute_indices(post)
 df = pd.concat([pre, post], ignore_index=True)
 
 # ---------------------------
-# Sidebar: Filtreler ve Seçimler
+# Sidebar: Filtreler ve Seçimler (ADVANCED ENGLISH FLOWCHART)
 # ---------------------------
-st.sidebar.title("Ayarlar")
-page = st.sidebar.radio("Sayfa:", ["1. Özet Tablo", "2. Grafikler", "3. Korelasyon", "4. Regresyon"])
+st.sidebar.title("Settings & Flow")
+page = st.sidebar.radio("Page:", ["1. Summary Table", "2. Plots", "3. Correlation", "4. Regression"])
 
 st.sidebar.markdown("---")
-if st.sidebar.checkbox("Sadece SII verisi olanlar", True):
-    df_f = df.dropna(subset=["SII"]) if "SII" in df.columns else df
-else:
-    df_f = df
+st.sidebar.header("🛡️ Exclusion Criteria")
 
-# --- EKLENEN CRP FİLTRESİ ---
+# --- FLOWCHART İÇİN YARDIMCI FONKSİYON ---
+def get_stats_str(d):
+    """Verilen dataframe için N, Pre/Post ve Male/Female sayılarını döndürür."""
+    n = len(d)
+    if n == 0: return "N=0"
+    
+    # Pre/Post
+    n_pre = len(d[d["PERIOD"] == "Pre"])
+    n_post = len(d[d["PERIOD"] == "Post"])
+    
+    # Male/Female (1:Male, 2:Female)
+    n_male = len(d[d["SEX"] == 1])
+    n_female = len(d[d["SEX"] == 2])
+    
+    return f"N = {n}\\n(Pre: {n_pre}, Post: {n_post})\\n(Male: {n_male}, Female: {n_female})"
+
+# --- BAŞLANGIÇ VERİSİ ---
+df_f = df.copy()
+initial_stats = get_stats_str(df_f)
+
+# Graphviz Başlangıcı
+steps = []
+node_counter = 0
+
+# --- 0. HAMİLELİK FİLTRESİ ---
+if "PREGNANCY" in df_f.columns:
+    if st.sidebar.checkbox("Exclude Pregnancy", value=True):
+        n_before = len(df_f)
+        df_f = df_f[df_f["PREGNANCY"] != 1] # 1=Yes, dışla
+        loss = n_before - len(df_f)
+        
+        if loss > 0:
+            node_counter += 1
+            steps.append({
+                "label": "Excluded (Pregnancy)",
+                "loss_n": loss,
+                "stats": get_stats_str(df_f),
+                "id": node_counter
+            })
+
+# --- 1. MEVSİM FİLTRESİ ---
+season_loss = 0
+n_before = len(df_f)
+if "SEASON_CODE" in df_f.columns:
+    st.sidebar.subheader("📅 Seasonality")
+    season_choice = st.sidebar.radio("Select Season:", ["All", "Winter (1)", "Summer (2)"], index=0)
+    
+    if season_choice != "All":
+        target_code = 1 if "Winter" in season_choice else 2
+        df_f = df_f[df_f["SEASON_CODE"] == target_code]
+        loss = n_before - len(df_f)
+        
+        if loss > 0:
+            node_counter += 1
+            steps.append({
+                "label": f"Excluded (Season: {season_choice})",
+                "loss_n": loss,
+                "stats": get_stats_str(df_f),
+                "id": node_counter
+            })
+
+# --- 2. YAŞ FİLTRESİ (18+) ---
+st.sidebar.subheader("🔞 Age Group")
+only_adults = st.sidebar.checkbox("Adults Only (18+)", value=True)
+
+if only_adults and "AGE" in df_f.columns:
+    n_before = len(df_f)
+    df_f = df_f[df_f["AGE"] >= 18]
+    loss = n_before - len(df_f)
+    
+    if loss > 0:
+        node_counter += 1
+        steps.append({
+            "label": "Excluded (Age < 18)",
+            "loss_n": loss,
+            "stats": get_stats_str(df_f),
+            "id": node_counter
+        })
+
+# --- 3. EKSİK VERİ FİLTRESİ ---
+sii_filter = st.sidebar.checkbox("Exclude Missing SII Data", value=True)
+
+if sii_filter and "SII" in df_f.columns:
+    n_before = len(df_f)
+    df_f = df_f.dropna(subset=["SII"])
+    loss = n_before - len(df_f)
+    
+    if loss > 0:
+        node_counter += 1
+        steps.append({
+            "label": "Excluded (Missing Data)",
+            "loss_n": loss,
+            "stats": get_stats_str(df_f),
+            "id": node_counter
+        })
+
+# --- 4. CRP FİLTRESİ ---
 if "CRP" in df_f.columns:
-    if st.sidebar.checkbox("CRP > 10 olanları dışla (Enfeksiyon)", value=False):
+    if st.sidebar.checkbox("Exclude Active Infection (CRP > 10)", value=False):
+        n_before = len(df_f)
         df_f = df_f[df_f["CRP"] <= 10]
+        loss = n_before - len(df_f)
+        
+        if loss > 0:
+            node_counter += 1
+            steps.append({
+                "label": "Excluded (Infection/CRP>10)",
+                "loss_n": loss,
+                "stats": get_stats_str(df_f),
+                "id": node_counter
+            })
 
-gender_filter = st.sidebar.radio("Cinsiyet:", ["Tümü", "Kadın (2)", "Erkek (1)"])
-if gender_filter == "Kadın (2)": df_f = df_f[df_f["SEX"] == 2]
-if gender_filter == "Erkek (1)": df_f = df_f[df_f["SEX"] == 1]
+# --- 5. CİNSİYET FİLTRESİ ---
+st.sidebar.subheader("Gender")
+gender_filter = st.sidebar.radio("Select Gender:", ["All", "Female (2)", "Male (1)"])
+
+if gender_filter != "All":
+    n_before = len(df_f)
+    target_sex = 2 if "Female" in gender_filter else 1
+    df_f = df_f[df_f["SEX"] == target_sex]
+    loss = n_before - len(df_f)
+    
+    if loss > 0:
+        node_counter += 1
+        steps.append({
+            "label": f"Excluded ({'Male' if target_sex==2 else 'Female'})",
+            "loss_n": loss,
+            "stats": get_stats_str(df_f),
+            "id": node_counter
+        })
+
+# --- GRAPHVIZ STRİNG OLUŞTURMA (İNGİLİZCE) ---
+final_dot = f"""
+digraph Flow {{
+    rankdir=TB;
+    node [fontname="Helvetica", fontsize=10, shape=box, style="filled,rounded"];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // Node 0: Total Data
+    node0 [label="Total Data\\n{initial_stats}", fillcolor="#E1F5FE", color="#0277BD", penwidth=1.5];
+"""
+
+prev_node = "node0"
+
+for step in steps:
+    curr_id = step['id']
+    loss_node = f"loss{curr_id}"
+    main_node = f"node{curr_id}"
+    
+    # 1. Kayıp Düğümü (Kırmızı Sekizgen)
+    final_dot += f'{loss_node} [label="{step["label"]}\\nn = {step["loss_n"]}", shape=octagon, fillcolor="#FFCDD2", color="#C62828"];\n'
+    
+    # 2. Kalan Düğümü (Mavi)
+    final_dot += f'{main_node} [label="Remaining\\n{step["stats"]}", fillcolor="#E1F5FE", color="#0277BD"];\n'
+    
+    # 3. Bağlantılar
+    final_dot += f'{prev_node} -> {loss_node} [style=dashed, color="red", arrowsize=0.8];\n'
+    final_dot += f'{prev_node} -> {main_node} [color="black", arrowsize=0.8];\n'
+    
+    prev_node = main_node
+
+# Son Düğümü Yeşile Boya (Final Data)
+final_dot += f'{prev_node} [label="Final Analysis Data\\n{get_stats_str(df_f)}", fillcolor="#C8E6C9", color="#2E7D32", penwidth=2.5];\n'
+final_dot += "}"
+
+# --- FLOWCHART GÖSTERİMİ ---
+st.sidebar.markdown("---")
+with st.sidebar.expander("📊 Study Flowchart", expanded=True):
+    st.graphviz_chart(final_dot)
+    
+    if len(df_f) == 0:
+        st.error("⚠️ No data left! Please relax the filters.")
+
+# =========================================================
+# !!! KRİTİK KISIM !!!
+# FLOWCHART'TAN SONRA, ANALİZ İÇİN GEREKLİ DEĞİŞKENLERİ 
+# TEKRAR TANIMLAMAMIZ GEREKİYOR (SİLİNEN KISIM BURASIYDI)
+# =========================================================
 
 # Değişken Seçimi
 st.sidebar.markdown("---")
-st.sidebar.subheader("Değişkenler")
+st.sidebar.subheader("Variables")
 default_vars = ["SII", "NLR", "dNLR", "PLR", "MLR", "NMLR", "SYSTOLICBP", "DIASTOLICBP", "PULSEAVG", "CRP", "WBC", "AGE", "BMI", "WAIST_CM", "SMOKING_STATUS"]
 avail_vars = [c for c in default_vars if c in df_f.columns]
 all_cols = sorted(list(df_f.columns))
 
-# BURADA SEÇİLENLER 'vars_to_analyze' İÇİNE GİRER
-vars_to_analyze = st.sidebar.multiselect("Seçiniz:", all_cols, default=avail_vars)
+vars_to_analyze = st.sidebar.multiselect("Select Variables to Analyze:", all_cols, default=avail_vars)
 
-# --- DÜZELTİLEN KISIM BAŞLANGICI ---
-st.sidebar.info("👇 Sayısal görünüp Kategorik olanları seç (Ki-Kare için)")
+st.sidebar.info("👇 Select categorical vars (for Chi-Square)")
 default_cats = ["SEX", "RACE", "SMOKING_STATUS"]
-# Sadece şu an seçili olan değişkenlerin içinden varsayılanları belirle!
 valid_cat_defaults = [c for c in default_cats if c in vars_to_analyze]
 
-forced_cat_vars = st.sidebar.multiselect("Kategorik Zorlama", vars_to_analyze, default=valid_cat_defaults)
-# --- DÜZELTİLEN KISIM BİTİŞİ ---
+forced_cat_vars = st.sidebar.multiselect("Force Categorical", vars_to_analyze, default=valid_cat_defaults)
 
-force_parametric = st.sidebar.checkbox("Parametrik Zorla (T-Test)", False)
+force_parametric = st.sidebar.checkbox("Force Parametric (T-Test)", False)
+
+# --- YENİ EKLENEN: TABLO FORMAT AYARI (SIDEBAR) ---
+st.sidebar.markdown("---")
+non_param_style = st.sidebar.radio(
+    "Non-Parametric Format:",
+    ["Median [IQR] (Q1–Q3)", "Median [Min–Max]"],
+    index=0,
+    help="Tabloda parametrik olmayan verilerin (Medyan) yanındaki parantez içi değerin formatını seçin."
+)
 
 pre_f = df_f[df_f["PERIOD"]=="Pre"]
 post_f = df_f[df_f["PERIOD"]=="Post"]
@@ -291,8 +445,8 @@ post_f = df_f[df_f["PERIOD"]=="Post"]
 # =========================================================
 # SAYFA 1: ÖZET TABLO (SİMGELİ ETKİ BÜYÜKLÜKLERİ: d, e)
 # =========================================================
-if page == "1. Özet Tablo":
-    st.header("1. Özet İstatistikler")
+if page == "1. Summary Table":
+    st.header("1. Summary Statistics")
     
     rows = []
     posthoc_results = {}
@@ -305,13 +459,21 @@ if page == "1. Özet Tablo":
     SYM_V = "ᵉ"       # Cramer's V (Kategorik - User isteği 'e')
 
     # --- YARDIMCI FONKSİYONLAR ---
-    def fmt_median_iqr(series):
+    def fmt_non_param(series, style_choice):
         s = pd.to_numeric(series, errors="coerce").dropna()
         if s.empty: return "NA"
         med = s.median()
-        q1 = s.quantile(0.25)
-        q3 = s.quantile(0.75)
-        return f"{med:.3g} [{q1:.3g}–{q3:.3g}]"
+        
+        if "Min" in style_choice:
+            # Min-Max Formatı
+            low = s.min()
+            high = s.max()
+        else:
+            # IQR Formatı (Varsayılan)
+            low = s.quantile(0.25)
+            high = s.quantile(0.75)
+        
+        return f"{med:.3g} [{low:.3g}–{high:.3g}]"
 
     def fmt_mean_sd(series):
         s = pd.to_numeric(series, errors="coerce").dropna()
@@ -407,8 +569,9 @@ if page == "1. Özet Tablo":
                 test_sym = SYM_T
             else:
                 _, p = mannwhitneyu(pre_vals, post_vals)
-                d_pre = fmt_median_iqr(pre_vals)
-                d_post = fmt_median_iqr(post_vals)
+                # Yeni fonksiyonu sidebar'daki seçimle çağırıyoruz
+                d_pre = fmt_non_param(pre_vals, non_param_style)
+                d_post = fmt_non_param(post_vals, non_param_style)
                 test_sym = SYM_MWU
                 
             rows.append({
@@ -495,64 +658,74 @@ if page == "1. Özet Tablo":
             st.warning("Veri yok.")
     else:
         st.info("Alt grup analizi için seçim yapınız.")
+
 # =========================================================
 # SAYFA 2: GRAFİKLER (OUTLIER YÖNETİMİ VE LOG SCALE EKLENDİ)
 # =========================================================
-elif page == "2. Grafikler":
-    st.header("2. Grafikler (Yayına Hazırlık Modu)")
+elif page == "2. Plots":
+    st.header("2. Graphs (Publication Ready)")
 
     # --- 1. DEĞİŞKEN SEÇİMİ ---
     plot_vars = st.multiselect(
-        "Çizilecek Değişkenleri Seçin:", 
+        "Select Variables to Plot:", 
         vars_to_analyze, 
         default=vars_to_analyze[:min(4, len(vars_to_analyze))] if len(vars_to_analyze) > 0 else None
     )
 
     if plot_vars:
         # --- 2. GRAFİK AYARLARI (EXPANDER) ---
-        with st.expander("⚙️ Grafik Görünüm & İstatistik Ayarları", expanded=True):
-            tab1, tab2, tab3 = st.tabs(["📊 Veri & Eksen", "📏 Çizgi Stili", "🏷️ Etiketler"])
+        with st.expander("⚙️ Graph Settings", expanded=True):
+            tab1, tab2, tab3 = st.tabs(["📊 Data & Axis", "📏 Line Style", "🏷️ Labels"])
             
             with tab1:
                 col_data1, col_data2 = st.columns(2)
                 with col_data1:
-                    st.markdown("##### 🔍 Veri Gösterimi")
+                    st.markdown("##### 🔍 Data View")
                     # Outlier Filtresi
-                    remove_outliers = st.checkbox("Aykırı Değerleri Gizle (Outliers - IQR Yöntemi)", value=False, help="Grafiği bastıran çok yüksek değerleri (Q3 + 1.5*IQR üzerini) gizler. Medyan farklarını görmek için idealdir.")
+                    remove_outliers = st.checkbox("Hide Outliers (IQR Method)", value=False, help="Grafiği bastıran çok yüksek değerleri (Q3 + 1.5*IQR üzerini) gizler. Medyan farklarını görmek için idealdir.")
+                    # --- YENİ EKLENEN: MANUEL ÜST KESİM (SLIDER) ---
+                    upper_cut = st.slider(
+                        "Upper Cut Limit (%)", 
+                        min_value=75.0, 
+                        max_value=100.0, 
+                        value=100.0, 
+                        step=0.5,
+                        help="Verinin yüzde kaçını görmek istediğinizi seçin. Örneğin 95'e ayarlarsanız, en yüksek %5'lik uç değerler grafikten atılır (Alt değerlere dokunulmaz)."
+                    )
                     # Log Scale
-                    use_log = st.checkbox("Logaritmik Ölçek (Log Scale)", value=False, help="Aşırı büyük ve küçük değerleri aynı grafikte dengeli gösterir.")
+                    use_log = st.checkbox("Logarithmic Scale", value=False, help="Aşırı büyük ve küçük değerleri aynı grafikte dengeli gösterir.")
                     
                     # İstatistik Tipi
                     plot_type = st.radio(
-                        "İstatistiksel Özet:", 
-                        ["Ortalama ± SD (Mean ± SD)", "Medyan ± IQR (Median ± IQR)"],
+                        "Statistical Summary:", 
+                        ["Mean ± SD", "Median ± IQR"],
                         horizontal=True
                     )
                 with col_data2:
-                    st.markdown("##### 🎨 Görünüm")
-                    cols_num = st.slider("Yan Yana Grafik", 1, 4, 2)
-                    dot_size = st.slider("Nokta Büyüklüğü", 1, 15, 4)
-                    c1 = st.color_picker("Pre Rengi", "#4c72b0")
-                    c2 = st.color_picker("Post Rengi", "#c44e52")
+                    st.markdown("##### 🎨 Appearance")
+                    cols_num = st.slider("Columns", 1, 4, 2)
+                    dot_size = st.slider("Dot Size", 1, 15, 4)
+                    c1 = st.color_picker("Pre Color", "#4c72b0")
+                    c2 = st.color_picker("Post Color", "#c44e52")
 
             with tab2:
-                st.markdown("##### Hata Çubukları (Error Bars)")
+                st.markdown("##### Error Bars")
                 col_err1, col_err2, col_err3 = st.columns(3)
                 with col_err1:
-                    err_linewidth = st.slider("Çizgi Kalınlığı", 0.5, 5.0, 1.5)
+                    err_linewidth = st.slider("Line Width", 0.5, 5.0, 1.5)
                 with col_err2:
-                    err_capsize = st.slider("Şapka Genişliği", 0, 20, 8)
+                    err_capsize = st.slider("Cap Size", 0, 20, 8)
                 with col_err3:
-                    err_capthick = st.slider("Şapka Kalınlığı", 0.5, 5.0, 1.5)
+                    err_capthick = st.slider("Cap Thickness", 0.5, 5.0, 1.5)
 
             with tab3:
-                st.info("Tek değişken seçiliyse başlıkları özelleştirebilirsiniz.")
-                custom_title = st.text_input("Grafik Başlığı", value="")
+                st.info("Customize titles if single variable selected.")
+                custom_title = st.text_input("Graph Title", value="")
                 col_lbl1, col_lbl2 = st.columns(2)
-                with col_lbl1: custom_xlabel = st.text_input("X Ekseni", value="Grup")
-                with col_lbl2: custom_ylabel = st.text_input("Y Ekseni", value=plot_vars[0] if len(plot_vars)==1 else "Değer")
+                with col_lbl1: custom_xlabel = st.text_input("X Axis Label", value="Group")
+                with col_lbl2: custom_ylabel = st.text_input("Y Axis Label", value=plot_vars[0] if len(plot_vars)==1 else "Value")
 
-        is_parametric_plot = "Ortalama" in plot_type
+        is_parametric_plot = "Mean" in plot_type
         
         # --- 3. ÇİZİM MOTORU ---
         rows_num = int(np.ceil(len(plot_vars) / cols_num))
@@ -568,9 +741,10 @@ elif page == "2. Grafikler":
         for i, v in enumerate(plot_vars):
             ax = axes[i]
             
-            # --- OUTLIER FİLTRELEME ---
+            # --- GÖRSEL VERİ HAZIRLIĞI ---
             plot_data = df_f.copy()
             
+            # 1. IQR Filtresi (Varsa)
             if remove_outliers and pd.api.types.is_numeric_dtype(plot_data[v]):
                 Q1 = plot_data[v].quantile(0.25)
                 Q3 = plot_data[v].quantile(0.75)
@@ -578,6 +752,13 @@ elif page == "2. Grafikler":
                 upper_limit = Q3 + 1.5 * IQR
                 lower_limit = Q1 - 1.5 * IQR
                 plot_data = plot_data[(plot_data[v] <= upper_limit) & (plot_data[v] >= lower_limit)]
+
+            # 2. Manuel Üst Kesim (Slider < 100 ise çalışır)
+            if upper_cut < 100.0 and pd.api.types.is_numeric_dtype(plot_data[v]):
+                # Kullanıcının seçtiği yüzdeliğe (örn: 0.95) denk gelen değeri bul
+                limit_high = plot_data[v].quantile(upper_cut / 100.0)
+                # Sadece üstten kes, alttan kesme
+                plot_data = plot_data[plot_data[v] <= limit_high]
             
             # Kategorik kontrolü
             is_categorical = (v in forced_cat_vars) or (plot_data[v].dtype == 'object')
@@ -585,7 +766,7 @@ elif page == "2. Grafikler":
             if is_categorical:
                 counts = plot_data.groupby(["PERIOD", v]).size().reset_index(name="Count")
                 sns.barplot(data=counts, x="PERIOD", y="Count", hue=v, ax=ax, palette="Set2")
-                ax.set_title(f"{v} Dağılımı")
+                ax.set_title(f"{v} Distribution")
             else:
                 # --- DOT PLOT ---
                 sns.stripplot(
@@ -606,8 +787,12 @@ elif page == "2. Grafikler":
 
                     if is_parametric_plot:
                         center = subset.mean()
-                        spread = subset.std()
-                        yerr = spread 
+                        # %95 Confidence Interval Hesabı (Mean için)
+                        # Formül: 1.96 * (Standart Sapma / Karekök(N))
+                        sd = subset.std()
+                        n = len(subset)
+                        sem = sd / np.sqrt(n) # Standart Hata
+                        yerr = 1.96 * sem     # %95 Güven Aralığı
                     else:
                         center = subset.median()
                         q1 = subset.quantile(0.25)
@@ -660,7 +845,7 @@ elif page == "2. Grafikler":
                     
                     bracket_h = y_max_data + (y_rng * 0.10) 
                     text_h = bracket_h + (y_rng * 0.02)     
-                    tick_len = y_rng * 0.03                 
+                    tick_len = y_rng * 0.03                  
 
                     # Çizim
                     ax.plot([0, 0, 1, 1], [bracket_h - tick_len, bracket_h, bracket_h, bracket_h - tick_len], 
@@ -672,11 +857,24 @@ elif page == "2. Grafikler":
                     if text_h > current_ylim[1] or True: 
                          ax.set_ylim(current_ylim[0], text_h + (y_rng * 0.15))
 
-            # --- LOG SCALE AYARI ---
+            # --- LOG SCALE AYARI (DÜZELTİLMİŞ: Negatifleri Gizle) ---
             if use_log:
-                ax.set_yscale('log')
+                # symlog kullanıyoruz (0 hatası vermesin diye)
+                ax.set_yscale('symlog', linthresh=0.1)
+                
+                # Bilimsel gösterimi kapat
                 from matplotlib.ticker import ScalarFormatter
-                ax.yaxis.set_major_formatter(ScalarFormatter())
+                formatter = ScalarFormatter()
+                formatter.set_scientific(False)
+                ax.yaxis.set_major_formatter(formatter)
+                
+                # EKSEN LİMİTLERİ (KRİTİK DÜZELTME)
+                # Mevcut limitleri al
+                bottom, top = ax.get_ylim()
+                
+                # Alt limiti kesinlikle 0 yap (Negatifleri at)
+                # Üst limiti P değeri yazısı sığsın diye biraz daha açıyoruz (* 2.0)
+                ax.set_ylim(0, top * 2.0)
 
             # --- ETİKETLER ---
             if len(plot_vars) == 1:
@@ -708,11 +906,12 @@ elif page == "2. Grafikler":
             st.download_button("📥 Grafiği İndir (300 DPI)", buf.getvalue(), "grafik.png", "image/png", use_container_width=True)
     else:
         st.info("Lütfen soldan veya yukarıdan en az bir değişken seçin.")
+
 # =========================================================
 # SAYFA 3: KORELASYON (GELİŞMİŞ HEATMAP EDİTÖRÜ)
 # =========================================================
-elif page == "3. Korelasyon":
-    st.header("3. Korelasyon Analizi (Heatmap)")
+elif page == "3. Correlation":
+    st.header("3. Correlation Analysis (Heatmap)")
 
     # 1. Sadece Sayısal Değişkenleri Seç
     num_cols = [c for c in vars_to_analyze if pd.api.types.is_numeric_dtype(df_f[c]) and c not in forced_cat_vars]
@@ -721,27 +920,27 @@ elif page == "3. Korelasyon":
         st.warning("⚠️ Korelasyon analizi yapabilmek için sol taraftan en az 2 adet sayısal değişken seçmelisiniz.")
     else:
         # --- AYARLAR MENÜSÜ ---
-        with st.expander("⚙️ Korelasyon ve Görünüm Ayarları", expanded=True):
-            tab1, tab2 = st.tabs(["📊 Analiz & Stil", "📐 Boyutlar"])
+        with st.expander("⚙️ Heatmap Settings", expanded=True):
+            tab1, tab2 = st.tabs(["📊 Analysis & Style", "📐 Dimensions"])
             
             with tab1:
                 col_c1, col_c2, col_c3 = st.columns(3)
                 with col_c1:
-                    corr_method = st.selectbox("Yöntem", ["spearman", "pearson", "kendall"], help="Normal dağılım yoksa Spearman önerilir.")
-                    mask_upper = st.checkbox("Üst Üçgeni Gizle (Mask Upper)", value=True, help="Simetrik tekrarı önler, daha sade görünür.")
+                    corr_method = st.selectbox("Method", ["spearman", "pearson", "kendall"], help="Normal dağılım yoksa Spearman önerilir.")
+                    mask_upper = st.checkbox("Mask Upper Triangle", value=True, help="Simetrik tekrarı önler, daha sade görünür.")
                 with col_c2:
-                    cmap_choice = st.selectbox("Renk Paleti", ["coolwarm", "RdBu_r", "viridis", "magma", "seismic", "icefire"], index=0)
-                    show_annot = st.checkbox("Değerleri Göster", value=True)
+                    cmap_choice = st.selectbox("Color Palette", ["coolwarm", "RdBu_r", "viridis", "magma", "seismic", "icefire"], index=0)
+                    show_annot = st.checkbox("Show Values", value=True)
                 with col_c3:
-                    annot_font_size = st.slider("Yazı Puntosu (Font Size)", 6, 24, 10)
-                    decimals = st.slider("Ondalık Basamak", 1, 4, 2)
+                    annot_font_size = st.slider("Font Size", 6, 24, 10)
+                    decimals = st.slider("Decimals", 1, 4, 2)
 
             with tab2:
                 col_d1, col_d2 = st.columns(2)
                 with col_d1:
-                    fig_width = st.slider("Grafik Genişliği", 6, 30, 12)
+                    fig_width = st.slider("Graph Width", 6, 30, 12)
                 with col_d2:
-                    fig_height = st.slider("Grafik Yüksekliği", 6, 30, 10)
+                    fig_height = st.slider("Graph Height", 6, 30, 10)
 
         # --- HESAPLAMA ---
         corr_matrix = df_f[num_cols].corr(method=corr_method)
@@ -756,7 +955,7 @@ elif page == "3. Korelasyon":
 
         sns.heatmap(
             corr_matrix, 
-            annot=show_annot,           # Değerleri yaz/yazma
+            annot=show_annot,            # Değerleri yaz/yazma
             fmt=f".{decimals}f",        # Virgülden sonra kaç basamak
             cmap=cmap_choice,           # Renk paketi
             ax=ax, 
@@ -795,11 +994,11 @@ elif page == "3. Korelasyon":
 # =========================================================
 # SAYFA 4: KOMPAKT ÇOKLU REGRESYON (STANDARDIZE GÖRSEL SEÇENEĞİ)
 # =========================================================
-elif page == "4. Regresyon":
-    st.header("4. Çoklu Regresyon Özeti (Compact Summary)")
+elif page == "4. Regression":
+    st.header("4. Multivariate Regression Summary")
     st.markdown("""
-    Bu modül, seçilen tüm parametreler (SII, NLR, PLR vb.) için ayrı ayrı regresyon modeli kurar.
-    Karmaşayı önlemek için sadece **Ana Faktörün** (Örn: PERIOD) etkisini raporlar.
+    This module builds regression models for each parameter separately.
+    It reports the effect of the **Main Factor** (e.g., PERIOD) adjusted for confounders.
     """)
     
     st.markdown("---")
@@ -808,28 +1007,37 @@ elif page == "4. Regresyon":
     numeric_candidates = df_f.select_dtypes(include=np.number).columns.tolist()
     
     # A) TARGETS
-    defaults = [c for c in ["SII", "NLR", "PLR", "dNLR", "CRP"] if c in numeric_candidates]
-    targets = st.multiselect("1. Analiz Edilecek Parametreler (Satırlar):", 
+    # Sizin belirlediğiniz öncelikli liste
+    wanted_defaults = [
+        "WBC", "NEUT_ABS", "LYMPH_ABS", "MONO_ABS", "PLT", "MPV", 
+        "SII", "SIRI", "NLR", "dNLR", "PLR", "MLR", "NMLR", "AISI"
+    ]
+    
+    # Bu listedekilerden, sadece yüklenen dosyada mevcut olanları seç (Hata almamak için)
+    defaults = [c for c in wanted_defaults if c in numeric_candidates]
+    
+    targets = st.multiselect("1. Parameters to Analyze (Rows):", 
                              numeric_candidates, default=defaults)
     
     # B) ANA FAKTÖR
     remaining = [c for c in all_cols if c not in targets]
     main_factor_def = remaining.index("PERIOD") if "PERIOD" in remaining else 0
-    main_factor = st.selectbox("2. Ana Faktör (Grup/Dönem):", remaining, index=main_factor_def)
+    main_factor = st.selectbox("2. Main Factor (Group/Period):", remaining, index=main_factor_def)
     
     # C) CONFOUNDERS
     std_confounders = ["AGE", "SEX", "BMI", "RACE", "SMOKING_STATUS"]
     avail_conf = [c for c in std_confounders if c in df_f.columns and c not in targets and c != main_factor]
     
-    confounders = st.multiselect("3. Düzeltme Faktörleri (Adjusted for):", 
+    confounders = st.multiselect("3. Adjust for (Confounders):", 
                                  options=[c for c in remaining if c != main_factor],
                                  default=avail_conf)
     
     st.markdown("---")
 
-    if st.button("Tablo ve Grafiği Oluştur"):
+    # --- HESAPLAMA BUTONU ---
+    if st.button("Generate Table & Plot"):
         if not targets:
-            st.warning("Lütfen en az bir parametre seçin.")
+            st.warning("Please select at least one parameter.")
         else:
             summary_data = []
             predictors = [main_factor] + confounders
@@ -844,14 +1052,12 @@ elif page == "4. Regresyon":
                 
                 if len(model_data) < 50: continue
 
-                # Standart Sapma (Görsel Düzeltme İçin Lazım Olacak)
                 target_std = model_data[target_var].std()
 
                 # Model Kurulumu
                 formula = f"{target_var} ~ {' + '.join(predictors)}"
                 model = smf.ols(formula, data=model_data).fit()
                 
-                # Hedef Katsayıyı Bul
                 target_coef_name = None
                 for name in model.params.index:
                     if main_factor in name and name != "Intercept":
@@ -862,94 +1068,248 @@ elif page == "4. Regresyon":
                     coef = model.params[target_coef_name]
                     conf = model.conf_int().loc[target_coef_name]
                     p_val = model.pvalues[target_coef_name]
-                    
                     p_str = "<0.001" if p_val < 0.001 else f"{p_val:.3f}"
+                    
+                    # Standardize Beta Hesabı (Grafikteki mantığın aynısı)
+                    if target_std != 0:
+                        std_beta = coef / target_std
+                    else:
+                        std_beta = 0
                     
                     summary_data.append({
                         "Parametre": target_var,
-                        "Adjusted Beta (Grup)": f"{coef:.2f}",
-                        "%95 GA": f"{conf[0]:.2f} – {conf[1]:.2f}",
-                        "p": p_str,
-                        # Gizli veriler (Grafik için)
+                        "Adjusted Beta (Raw)": f"{coef:.2f}",
+                        "SD of Dependent Var": f"{target_std:.2f}",  # YENİ SÜTUN (Standart Sapma)
+                        "Standardized Beta": f"{std_beta:.3f}",
+                        "%95 CI Lower": f"{conf[0]:.2f}",
+                        "%95 CI Upper": f"{conf[1]:.2f}",
+                        "p-value": p_str,
+                        "N": int(model.nobs),
+                        "R2": f"{model.rsquared:.3f}",
+                        # Gizli veriler
                         "_coef": coef,
                         "_lower": conf[0],
                         "_upper": conf[1],
                         "_p_val": p_val,
                         "_name": target_coef_name,
-                        "_std": target_std  # Görsel ölçekleme için
+                        "_std": target_std
                     })
             
             progress_bar.empty()
 
+            # --- SONUCU HAFIZAYA KAYDET (KRİTİK HAMLE) ---
             if summary_data:
-                # --- TABLO ---
-                df_res = pd.DataFrame(summary_data)
-                display_cols = ["Parametre", "Adjusted Beta (Grup)", "%95 GA", "p"]
-                
-                st.subheader("📊 Multivariate Regression Summary")
-                st.caption(f"**Adjusted for:** {', '.join(confounders)}")
-                st.table(df_res[display_cols])
-                
-                # --- FOREST PLOT ---
-                st.markdown("---")
-                st.subheader("📈 Forest Plot: Etki Karşılaştırması")
-                
-                # SEÇENEK: Standardizasyon
-                use_std = st.checkbox("✅ Grafiği Standardize Et (Görsel İyileştirme)", value=True, 
-                                      help="Farklı birimlerdeki (Örn: SII vs NLR) değişkenleri aynı ölçeğe getirir. Gri çizgilerin görünmesini sağlar.")
+                st.session_state['reg_results'] = pd.DataFrame(summary_data)
+                st.session_state['reg_confounders'] = confounders # Başlık için sakla
+            else:
+                st.error("Model could not be built.")
+
+    # --- SONUÇLARI GÖSTER (HAFIZADAN) ---
+    # Butona basılmasa bile hafızada veri varsa burası çalışır
+    if 'reg_results' in st.session_state:
+        df_res = st.session_state['reg_results']
+        current_confounders = st.session_state.get('reg_confounders', [])
+        
+        # --- 1. GELİŞMİŞ TABLO ---
+        st.markdown("---")
+        st.subheader("📊 Multivariate Regression Table")
+        st.caption(f"**Adjusted for:** {', '.join(current_confounders)}")
+        
+        # Tabloda artık hem Ham hem Standart değer görünecek
+        # YENİ SIRALAMA: Raw -> SD -> Standardized
+        show_cols = [
+            "Parametre", 
+            "Adjusted Beta (Raw)", 
+            "SD of Dependent Var",   # Yeni eklediğimiz sütun
+            "Standardized Beta", 
+            "p-value", 
+            "%95 CI Lower", 
+            "%95 CI Upper", 
+            "N", 
+            "R2"
+        ]
+        
+        # Güvenlik Kontrolü
+        missing_cols = [c for c in show_cols if c not in df_res.columns]
+        if not missing_cols:
+            st.dataframe(df_res[show_cols], use_container_width=True)
+            
+            # Tablo İndirme
+            csv_table = df_res[show_cols].to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Table (CSV)",
+                data=csv_table,
+                file_name="multivariate_regression_results.csv",
+                mime="text/csv",
+            )
+            
+            # --- 2. FOREST PLOT ---
+            st.markdown("---")
+            st.subheader("📈 Forest Plot")
+            
+            # Checkbox artık sayfayı yenilese bile veri 'st.session_state' içinde durduğu için grafik çizilir
+            use_std = st.checkbox("✅ Standardize Graph (Visual Improvement)", value=True, 
+                                  help="Scales different units to be comparable.")
+            
+            if use_std:
+                st.info("💡 **Info:** Values are divided by SD to get **'Standardized Beta'**.")
+            
+            # Grafik Verisi
+            plot_df = df_res.iloc[::-1]
+            
+            fig, ax = plt.subplots(figsize=(8, len(plot_df)*0.8 + 2))
+            y_pos = range(len(plot_df))
+            
+            for i, (idx, row) in enumerate(plot_df.iterrows()):
+                val_coef = row["_coef"]
+                val_low = row["_lower"]
+                val_high = row["_upper"]
                 
                 if use_std:
-                    st.info("💡 **Bilgi:** Değerler standart sapmalarına bölünerek **'Standardized Beta'**ya dönüştürüldü. Bu sayede küçük değerler (NLR) ile büyük değerler (SII) aynı grafikte net görülür.")
+                    s = row["_std"]
+                    val_coef /= s
+                    val_low /= s
+                    val_high /= s
                 
-                # Grafik Verisi
-                plot_df = df_res.iloc[::-1]
+                c = 'firebrick' if row["_p_val"] < 0.05 else 'gray'
+                alpha_line = 1.0 if row["_p_val"] < 0.05 else 0.5
                 
-                fig, ax = plt.subplots(figsize=(8, len(plot_df)*0.8 + 2))
-                y_pos = range(len(plot_df))
-                
-                # MANUEL DÖNGÜ (Hatasız Çizim)
-                for i, (idx, row) in enumerate(plot_df.iterrows()):
-                    # Verileri Çek
-                    val_coef = row["_coef"]
-                    val_low = row["_lower"]
-                    val_high = row["_upper"]
-                    
-                    # Eğer Standardizasyon Seçildiyse:
-                    if use_std:
-                        s = row["_std"]
-                        val_coef /= s
-                        val_low /= s
-                        val_high /= s
-                    
-                    # Renk Seçimi
-                    c = 'firebrick' if row["_p_val"] < 0.05 else 'gray'
-                    # Anlamsız olanları biraz daha soluk yapalım ki karışmasın
-                    alpha_line = 1.0 if row["_p_val"] < 0.05 else 0.5
-                    
-                    # 1. Çizgi
-                    ax.hlines(y=i, xmin=val_low, xmax=val_high, 
-                              color=c, linewidth=2, alpha=alpha_line, zorder=1)
-                    
-                    # 2. Nokta
-                    ax.plot(val_coef, i, 'o', 
-                            color=c, markersize=8, markeredgecolor='black', zorder=2)
+                ax.hlines(y=i, xmin=val_low, xmax=val_high, color=c, linewidth=2, alpha=alpha_line, zorder=1)
+                ax.plot(val_coef, i, 'o', color=c, markersize=8, markeredgecolor='black', zorder=2)
 
-                # 0 Referans Çizgisi
-                ax.axvline(x=0, color='black', linestyle='--', linewidth=1, zorder=0)
+            ax.axvline(x=0, color='black', linestyle='--', linewidth=1, zorder=0)
+            
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(plot_df["Parametre"], fontweight="bold", fontsize=10)
+            
+            xlabel = "Standardized Beta (Effect Size)" if use_std else f"Raw Adjusted Beta"
+            ax.set_xlabel(xlabel, fontweight="bold")
+            
+            ax.grid(axis='x', linestyle=':', alpha=0.5)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            
+            st.pyplot(fig)
+            
+            # Grafik İndirme
+            st.markdown("---")
+            col_rd1, col_rd2 = st.columns([3, 1])
+            with col_rd2:
+                import io 
+                buf = io.BytesIO()
+                fig.savefig(buf, format="png", dpi=300, bbox_inches='tight', transparent=True)
+                fname = "forest_plot_std.png" if use_std else "forest_plot_raw.png"
+                st.download_button(label="📥 Download Plot (300 DPI)", data=buf.getvalue(), file_name=fname, mime="image/png", use_container_width=True)
+        else:
+            st.warning("Please click 'Generate Table & Plot' again to update the table structure.")
+
+    # ==========================================
+    # ⬇️ 5. DETAYLI MODEL İNCELEMESİ (SEASON CODE EKLENDİ) ⬇️
+    # ==========================================
+    st.markdown("---")
+    st.header("5. Detailed Factor Analysis")
+    st.markdown("""
+    Compare the effect size of **all variables** (Age, BMI, Sex, Season, etc.) for a single selected parameter.
+    """)
+
+    # --- DEĞİŞİKLİK BURADA: Predictors Listesine SEASON_CODE Eklendi ---
+    predictors = [main_factor] + confounders
+    
+    # Eğer veride SEASON_CODE (Mevsim) varsa ve listeye zaten seçilmemişse, zorla ekle
+    if "SEASON_CODE" in df_f.columns and "SEASON_CODE" not in predictors:
+        predictors.append("SEASON_CODE")
+
+    # 1. Hangi parametreye bakacağız?
+    if not targets:
+        st.info("Please select at least one parameter above.")
+    else:
+        # Default olarak listenin ilkini değil, boş gelmesini sağlayabiliriz veya ilkini seçebiliriz.
+        detail_target = st.selectbox("🔍 Select Parameter to Inspect:", targets)
+
+        if detail_target:
+            # Model Verisi Hazırlama
+            cols = [detail_target] + predictors
+            # Sadece ilgili sütunları alıp boş verileri atıyoruz
+            model_data = df_f[cols].dropna()
+            
+            if len(model_data) > 30:
+                # Standart Sapma (Standardizasyon için)
+                y_std = model_data[detail_target].std()
                 
+                # Modeli Kur
+                formula = f"{detail_target} ~ {' + '.join(predictors)}"
+                model = smf.ols(formula, data=model_data).fit()
+                
+                # Tüm Katsayıları Çek (Intercept hariç)
+                params = model.params.drop("Intercept", errors='ignore')
+                conf = model.conf_int().drop("Intercept", errors='ignore')
+                pvals = model.pvalues.drop("Intercept", errors='ignore')
+                
+                # Veriyi Tablo Haline Getir
+                detail_rows = []
+                for var_name in params.index:
+                    coef = params[var_name]
+                    
+                    # Standardize Beta Hesabı
+                    if y_std != 0:
+                        std_beta = coef / y_std
+                        lower = conf.loc[var_name][0] / y_std
+                        upper = conf.loc[var_name][1] / y_std
+                    else:
+                        std_beta, lower, upper = 0, 0, 0
+                    
+                    detail_rows.append({
+                        "Faktör": var_name,
+                        "Std. Beta": std_beta,
+                        "Lower": lower,
+                        "Upper": upper,
+                        "p-value": pvals[var_name]
+                    })
+                
+                df_detail = pd.DataFrame(detail_rows)
+                
+                # Sıralama: Etki gücüne (Mutlak değer) göre sırala
+                df_detail["Abs_Effect"] = df_detail["Std. Beta"].abs()
+                df_detail = df_detail.sort_values("Abs_Effect", ascending=False)
+                
+                # --- GRAFİK ÇİZİMİ ---
+                fig_d, ax_d = plt.subplots(figsize=(8, len(df_detail) * 0.6 + 2))
+                
+                y_pos = range(len(df_detail))
+                
+                for i, (idx, row) in enumerate(df_detail.iterrows()):
+                    # Renk: P < 0.05 ise Kırmızı, değilse Gri
+                    c = '#d62728' if row["p-value"] < 0.05 else '#bdbdbd'
+                    # Şeffaflık
+                    alpha = 1.0 if row["p-value"] < 0.05 else 0.5
+                    
+                    # Hata Çubuğu ve Nokta
+                    ax_d.errorbar(x=row["Std. Beta"], y=i, 
+                                  xerr=[[row["Std. Beta"] - row["Lower"]], [row["Upper"] - row["Std. Beta"]]],
+                                  fmt='o', color=c, ecolor=c, capsize=4, elinewidth=2, alpha=alpha)
+                    
+                    # Değer Etiketi
+                    text_offset = 0.05 if row["Std. Beta"] >= 0 else -0.05
+                    
+                    ax_d.text(row["Std. Beta"], i - 0.3, f"{row['Std. Beta']:.2f}", 
+                              ha='center', va='center', fontsize=9, color=c, fontweight='bold')
+
                 # Eksenler
-                ax.set_yticks(y_pos)
-                ax.set_yticklabels(plot_df["Parametre"], fontweight="bold", fontsize=10)
+                ax_d.set_yticks(y_pos)
+                ax_d.set_yticklabels(df_detail["Faktör"], fontweight="bold", fontsize=10)
+                ax_d.axvline(x=0, color='black', linestyle='--', linewidth=1)
                 
-                xlabel = "Standardized Beta (Etki Gücü)" if use_std else f"Raw Adjusted Beta ({summary_data[0]['_name']})"
-                ax.set_xlabel(xlabel, fontweight="bold")
+                ax_d.set_xlabel("Standardized Effect Size (Beta / SD)", fontweight="bold")
+                ax_d.set_title(f"Determinants of {detail_target}\n(Relative Importance of Factors)", pad=10)
                 
-                # Grid ve Temizlik
-                ax.grid(axis='x', linestyle=':', alpha=0.5)
-                ax.spines['top'].set_visible(False)
-                ax.spines['right'].set_visible(False)
+                # Temizlik
+                ax_d.spines['top'].set_visible(False)
+                ax_d.spines['right'].set_visible(False)
+                ax_d.grid(axis='x', linestyle=':', alpha=0.5)
                 
-                st.pyplot(fig)
-
+                st.pyplot(fig_d)
+                
+                st.info(f"📌 **Interpretation:** This chart shows what drives **{detail_target}** the most. Red bars are statistically significant.")
+                
             else:
-                st.error("Model kurulamadı.")
+                st.warning("Not enough data for this analysis.")
