@@ -17,6 +17,10 @@ st.title("NHANES Pre vs Post – Final Analiz")
 RENAME_MAP = {
     # --- KİMLİK & AĞIRLIK ---
     "SEQN": "ID", "WTPH2YR": "WEIGHT_LAB",
+	# --- PSU, STRATA, WEİGHT LAB ---
+	"WTMEC2YR": "WEIGHT_MEC",  # Muayene ağırlığı (CRP, CBC gibi lab değerleri için bu kullanılır)
+    "SDMVSTRA": "STRATA",      # Tabaka
+    "SDMVPSU": "PSU",          # Birincil örnekleme birimi	
     # --- DEMOGRAFİ ---
     "RIDAGEYR": "AGE", "RIAGENDR": "SEX", "RIDRETH3": "RACE",
     "INDFMPIR": "PIR", "PERIOD": "PERIOD",
@@ -235,7 +239,7 @@ df = pd.concat([pre, post], ignore_index=True)
 # Sidebar: Filtreler ve Seçimler (ADVANCED ENGLISH FLOWCHART)
 # ---------------------------
 st.sidebar.title("Settings & Flow")
-page = st.sidebar.radio("Page:", ["1. Summary Table", "2. Plots", "3. Correlation", "4. Regression"])
+page = st.sidebar.radio("Page:", ["1. Summary Table", "2. Plots", "3. Correlation", "4. Regression", "5. Revised Regression model"])
 
 st.sidebar.markdown("---")
 st.sidebar.header("🛡️ Exclusion Criteria")
@@ -1726,3 +1730,213 @@ elif page == "4. Regression":
                     
             else:
                 st.warning("Not enough data for this analysis.")
+
+# =========================================================
+# SAYFA 5: MULTIVARIATE REGRESSION (EFFECT SIZE - RUTİN LİSTE)
+# =========================================================
+elif page == "5. Revised Regression model":
+    st.header("5. Multivariate Regression (NHANES Weighted)")
+    st.info("Bu modül, inflamatuar indekslerin değişimini Effect Size ölçeğinde analiz eder.")
+
+    # 1. PARAMETRE SEÇİMİ (İstediğiniz Rutin Liste)
+    numeric_candidates = df_f.select_dtypes(include=np.number).columns.tolist()
+    
+    # İstediğiniz rutin parametreler
+    rutin_list = [
+        "WBC", "NEUT_ABS", "LYMPH_ABS", "MONO_ABS", "PLT", "MPV", 
+        "SII", "SIRI", "NLR", "dNLR", "PLR", "dPLR", "MLR", "NMLR", "AISI", "CRP"
+    ]
+    
+    # Veride mevcut olanları default olarak ayarla
+    defaults = [p for p in rutin_list if p in numeric_candidates]
+    targets = st.multiselect("1. Parameters to Analyze (Rows):", numeric_candidates, default=defaults)
+    
+    remaining = [c for c in all_cols if c not in targets]
+    main_factor = st.selectbox("2. Main Factor (Group/Period):", remaining, index=remaining.index("PERIOD") if "PERIOD" in remaining else 0)
+    
+    conf_options = [c for c in remaining if c != main_factor]
+    safe_defaults = [d for d in ["AGE", "SEX", "BMI", "RACE", "SMOKING_STATUS"] if d in conf_options]
+    confounders = st.multiselect("3. Adjust for (Confounders):", options=conf_options, default=safe_defaults)
+
+    if st.button("🚀 Run NHANES Weighted Analysis"):
+        if not targets:
+            st.warning("Lütfen parametre seçin.")
+            st.stop()
+            
+        summary_data = []
+        import statsmodels.api as sm
+        import patsy
+
+        # Ağırlık birleştirme (WTMECPRP ve WTMEC2YR)
+        df_f['FINAL_WEIGHT'] = np.nan
+        for w_col in ['WTMECPRP', 'WTMEC2YR', 'WEIGHT_MEC']:
+            if w_col in df_f.columns:
+                df_f['FINAL_WEIGHT'] = df_f['FINAL_WEIGHT'].fillna(df_f[w_col])
+
+        weight_col = 'FINAL_WEIGHT'
+        psu_col = "PSU" if "PSU" in df_f.columns else ("SDMVPSU" if "SDMVPSU" in df_f.columns else None)
+
+        progress_bar = st.progress(0)
+        for i, target_var in enumerate(targets):
+            progress_bar.progress((i + 1) / len(targets))
+            
+            current_predictors = [main_factor] + confounders
+            cols = [target_var] + current_predictors + [weight_col]
+            if psu_col: cols.append(psu_col)
+
+            m_data = df_f[cols].dropna().copy()
+            m_data = m_data[m_data[weight_col] > 0]
+
+            if len(m_data) < 30 or m_data["PERIOD"].nunique() < 2:
+                continue
+
+            try:
+                formula_terms = [f"C(PERIOD, Treatment(reference='Pre'))" if p == "PERIOD" else p for p in current_predictors]
+                formula = f"{target_var} ~ {' + '.join(formula_terms)}"
+                y, X = patsy.dmatrices(formula, m_data, return_type='dataframe')
+
+                if psu_col and m_data[psu_col].nunique() > 1:
+                    model = sm.WLS(y, X, weights=m_data[weight_col]).fit(cov_type='cluster', cov_kwds={'groups': m_data[psu_col]})
+                else:
+                    model = sm.WLS(y, X, weights=m_data[weight_col]).fit()
+
+                coef_key = next((c for c in model.params.index if "Post" in c or (main_factor in c and "Intercept" not in c)), None)
+                
+                if coef_key:
+                    dep_sd = m_data[target_var].std()
+                    summary_data.append({
+                        "Parametre": target_var,
+                        "Adjusted Beta (Raw)": model.params[coef_key],
+                        "Standardized Beta": model.params[coef_key] / dep_sd,
+                        "p-value": model.pvalues[coef_key],
+                        "LCI_std": model.conf_int().loc[coef_key][0] / dep_sd,
+                        "UCI_std": model.conf_int().loc[coef_key][1] / dep_sd,
+                        "R2": model.rsquared,
+                        "SD_val": dep_sd # <--- Bu satırın eklendiğinden emin ol
+                    })
+            except:
+                continue
+        
+        progress_bar.empty()
+        if summary_data:
+            st.session_state['reg_df_v7'] = pd.DataFrame(summary_data)
+            st.rerun()
+
+    # --- PROFESYONEL FOREST PLOT (SIRALAMA GÜNCELLENDİ) ---
+    if 'reg_df_v7' in st.session_state:
+        res = st.session_state['reg_df_v7']
+        st.subheader("📈 Weighted Forest Plot (Effect Size)")
+        
+        # 1. ADIM: İSTEDİĞİNİZ SIRALAMAYI TANIMLAYIN
+        rutin_siralamasi = [
+            "WBC", "NEUT_ABS", "LYMPH_ABS", "MONO_ABS", "PLT", "MPV", 
+            "SII", "SIRI", "NLR", "dNLR", "PLR", "dPLR", "MLR", "NMLR", "AISI", "CRP"
+        ]
+        
+        # 2. ADIM: VERİYİ BU SIRAYA GÖRE DİZİN
+        # Veride olmayan parametreleri atla, olanları sizin sıranıza göre diz
+        res['Parametre'] = pd.Categorical(res['Parametre'], categories=rutin_siralamasi, ordered=True)
+        plot_df = res.sort_values("Parametre", ascending=False).copy() # Matplotlib alttan üste çizdiği için 'False'
+
+        # 3. ADIM: GÖRSEL ESTETİĞİ UYGULAYIN
+        fig, ax = plt.subplots(figsize=(10, len(plot_df)*0.6 + 2))
+        y_pos = range(len(plot_df))
+        
+        for i, (idx, row) in enumerate(plot_df.iterrows()):
+            # Anlamlılık rengi: Kırmızı (p<0.05), Gri (p>=0.05)
+            color = '#A52A2A' if row["p-value"] < 0.05 else '#808080'
+            
+            # Hata payları (Effect Size ölçeğinde)
+            err_left = abs(row["Standardized Beta"] - row["LCI_std"])
+            err_right = abs(row["UCI_std"] - row["Standardized Beta"])
+            
+            ax.errorbar(row["Standardized Beta"], i, xerr=[[err_left], [err_right]],
+                        fmt='o', color=color, ecolor=color, markersize=10, 
+                        markeredgecolor='black', elinewidth=2.5, capsize=0, zorder=3)
+
+        # Görsel detaylar (İstediğiniz resimdeki gibi)
+        ax.axvline(0, color='black', linestyle='--', linewidth=1.2, alpha=0.7, zorder=1)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(plot_df["Parametre"], fontweight='bold', fontsize=11)
+        ax.set_xlabel("Standardized Beta (Effect Size)\nΔ per 1 SD Change", fontsize=12, fontweight='bold')
+        
+        ax.grid(axis='x', linestyle=':', alpha=0.4, zorder=0)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_linewidth(1.5)
+        ax.spines['bottom'].set_linewidth(1.5)
+        
+        # Eksen limitlerini otomatik ama dengeli ayarla
+        max_val = max(abs(plot_df["Standardized Beta"].max()), abs(plot_df["Standardized Beta"].min()))
+        limit = (max_val + 0.05) if max_val > 0 else 0.3
+        ax.set_xlim(-limit, limit)
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+		
+        # Tablo Gösterimi
+        st.markdown("---")
+        # Tablo Hazırlığı
+        # Tablo Hazırlığı
+        disp = res.copy()
+        
+        # --- ÖZELLEŞTİRİLMİŞ P-VALUE FORMATLAMA ---
+        def format_p_value(p):
+            if not np.isfinite(p): return "NA"
+            if p < 0.001: return "<0.001"
+            if p < 0.01: return "<0.01"
+            if p < 0.05: return "<0.05"
+            return f"{p:.3f}"
+        
+        # p-value sütununu yeni mantığa göre güncelle
+        # Not: Veri setinde sayısal p değerleri "_p_val" veya "p-value" olarak saklanır
+        if "p-value" in disp.columns:
+            disp["p-value"] = disp["p-value"].apply(lambda x: format_p_value(float(x)) if pd.notnull(x) else "NA")
+        
+        # --- ÖZELLEŞTİRİLMİŞ SAYISAL FORMATLAMA ---
+        # 1. R2 ve Standardized Beta için 3 basamak (3f)
+        for col in ["R2", "Standardized Beta"]:
+            if col in disp.columns:
+                disp[col] = disp[col].apply(lambda x: f"{x:.3f}" if pd.notnull(x) else "NA")
+        
+        # 2. Diğer tüm sayısal sütunlar için 2 basamak (2f)
+        two_decimal_cols = ["Adjusted Beta (Raw)", "SD_val", "LCI_std", "UCI_std"]
+        for col in two_decimal_cols:
+            if col in disp.columns:
+                disp[col] = disp[col].apply(lambda x: f"{x:.2f}" if pd.notnull(x) else "NA")
+        
+        # Sütun isimlendirme
+        disp = disp.rename(columns={
+            "SD_val": "SD of Dependent Var",
+            "LCI_std": "%95 CI Lower",
+            "UCI_std": "%95 CI Upper"
+        })
+        
+        # Sütun sıralaması
+        show_cols = [
+            "Parametre", 
+            "Adjusted Beta (Raw)", 
+            "SD of Dependent Var", 
+            "Standardized Beta", 
+            "p-value", 
+            "%95 CI Lower", 
+            "%95 CI Upper", 
+            "R2"
+        ]
+        
+        st.dataframe(disp[show_cols], use_container_width=True, hide_index=True)
+
+		# --- GRAFİĞİ İNDİRME BUTONU (300 DPI) ---
+        st.markdown("---")
+        col_btn1, col_btn2 = st.columns([3, 1]) # Butonu sağa yaslamak için
+        with col_btn2:
+            buf = io.BytesIO()
+            # 300 DPI ve yüksek kalite ayarlarıyla kaydet
+            fig.savefig(buf, format="png", dpi=300, bbox_inches='tight', transparent=False, facecolor='white')
+            st.download_button(
+                label="📥 Download Plot (300 DPI)",
+                data=buf.getvalue(),
+                file_name="nhanes_forest_plot_300dpi.png",
+                mime="image/png",
+                use_container_width=True
+            )
