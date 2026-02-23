@@ -602,7 +602,6 @@ if page == "1. Summary Table":
             delta_val = cliffs_delta(pre_vals, post_vals)
             val_str = f"{delta_val:.2f}" if np.isfinite(delta_val) else "NA"
             
-            # Simge 'd' eklendi
             delta_str = f"{val_str} {SYM_DELTA}"
             
             if use_para:
@@ -612,22 +611,41 @@ if page == "1. Summary Table":
                 test_sym = SYM_T
             else:
                 _, p = mannwhitneyu(pre_vals, post_vals)
-                # Yeni fonksiyonu sidebar'daki seçimle çağırıyoruz
                 d_pre = fmt_non_param(pre_vals, non_param_style)
                 d_post = fmt_non_param(post_vals, non_param_style)
                 test_sym = SYM_MWU
                 
+            # BURASI HATANIN DÜZELDİĞİ VE N SÜTUNUNUN EKLENDİĞİ YER
             rows.append({
                 "Variable": v, 
                 "Pre (Ref)": d_pre, 
                 "Post": d_post,
                 "P-Value": f"{p_label_detailed(p)} {test_sym}",
-                "Effect Size": delta_str
-		
+                "Effect Size": delta_str,
+                "N": f"{len(pre_vals) + len(post_vals)}"
             })
             
     if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        df_res_table = pd.DataFrame(rows)
+        
+        # --- ANLAMLI P DEĞERLERİNİ BOLD YAPMA (STYLER) ---
+        def make_bold_significant(val):
+            try:
+                # String içindeki sadece sayısal kısmı al (p < 0.05 gibi durumlar için)
+                clean_val = ''.join(c for c in str(val) if c.isdigit() or c == '.')
+                # Eğer değer içinde "<" varsa veya sayısal olarak < 0.05 ise bold yap
+                is_significant = "<" in str(val) or (clean_val and float(clean_val) < 0.05)
+                return 'font-weight: bold' if is_significant else ''
+            except:
+                return ''
+
+        # Tabloyu stilize ederek ve N sütunuyla beraber göster
+        st.dataframe(
+            df_res_table.style.map(make_bold_significant, subset=['P-Value']), 
+            use_container_width=True, 
+            hide_index=True
+        )
+        
         st.markdown("---")
         st.caption(f"""
         **Dipnotlar:**
