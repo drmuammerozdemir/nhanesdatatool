@@ -560,7 +560,8 @@ if page == "1. Summary Table":
                     "Pre (Ref)": f"N={ct['Pre'].sum()}", 
                     "Post": f"N={ct['Post'].sum()}", 
                     "P-Value": f"{p_label_detailed(p_overall)} {SYM_CHI}", 
-                    "Effect Size": effect_str 
+                    "Effect Size": effect_str
+		    
                 })
 
                 # Post-Hoc
@@ -622,6 +623,7 @@ if page == "1. Summary Table":
                 "Post": d_post,
                 "P-Value": f"{p_label_detailed(p)} {test_sym}",
                 "Effect Size": delta_str
+		
             })
             
     if rows:
@@ -700,7 +702,67 @@ if page == "1. Summary Table":
             st.warning("Veri yok.")
     else:
         st.info("Alt grup analizi için seçim yapınız.")
+# --- 1. SUMMARY STATISTICS FORMATINDA PLR EŞİK ANALİZİ ---
+    if "PLR" in df_f.columns and "SEX" in df_f.columns:
+        st.markdown("---")
+        st.subheader("📊 PLR Threshold Analysis (Cut-off: 150)")
+        
+        # Kategorizasyon ve Etiketleme
+        df_f["PLR_Group"] = np.where(df_f["PLR"] > 150, "> 150", "≤ 150")
+        df_f["Gender_Label"] = df_f["SEX"].map({1: "Male", 2: "Female"})
+        
+        # Simgeler (Sayfa 1'deki tanımlarla uyumlu)
+        SYM_CHI = "ᶜ"
+        SYM_V = "ᵉ"
 
+        def calculate_cramers_v_local(ct):
+            chi2 = chi2_contingency(ct)[0]
+            n = ct.sum().sum()
+            phi2 = chi2 / n
+            r, k = ct.shape
+            phi2corr = max(0, phi2 - ((k-1)*(r-1))/(n-1))
+            rcorr = r - ((r-1)**2)/(n-1)
+            kcorr = k - ((k-1)**2)/(n-1)
+            if min((kcorr-1), (rcorr-1)) <= 0: return 0.0
+            return np.sqrt(phi2corr / min((kcorr-1), (rcorr-1)))
+
+        plr_rows = []
+        
+        # Cinsiyetlere göre döngü (Analiz satırları)
+        for gender in ["Female", "Male"]:
+            gender_df = df_f[df_f["Gender_Label"] == gender]
+            if gender_df.empty: continue
+            
+            ct = pd.crosstab(gender_df["PLR_Group"], gender_df["PERIOD"])
+            
+            # Eğer her iki dönem de mevcutsa hesapla
+            if "Pre" in ct.columns and "Post" in ct.columns:
+                chi2_val, p_val, _, _ = chi2_contingency(ct)
+                cramer_v = calculate_cramers_v_local(ct)
+                
+                # Pre ve Post için "> 150" olanların oranını göster
+                # (Sizin summary table mantığınızda her hücre tek metin)
+                n_pre_high = ct.loc["> 150", "Pre"] if "> 150" in ct.index else 0
+                n_post_high = ct.loc["> 150", "Post"] if "> 150" in ct.index else 0
+                
+                tot_pre = ct["Pre"].sum()
+                tot_post = ct["Post"].sum()
+                
+                val_pre = f"{n_pre_high} / {tot_pre} ({(n_pre_high/tot_pre)*100:.1f}%)"
+                val_post = f"{n_post_high} / {tot_post} ({(n_post_high/tot_post)*100:.1f}%)"
+
+                plr_rows.append({
+                    "Variable": f"PLR > 150 ({gender})",
+                    "Pre (Ref)": val_pre,
+                    "Post": val_post,
+                    "P-Value": f"{p_label_detailed(p_val)} {SYM_CHI}",
+                    "Effect Size": f"{cramer_v:.2f} {SYM_V}"
+                })
+
+        # Tabloyu bas
+        if plr_rows:
+            st.dataframe(pd.DataFrame(plr_rows), use_container_width=True, hide_index=True)
+            st.caption(f"**Note:** Values represent the count and percentage of individuals with PLR > 150. {SYM_CHI}: Chi-Square, {SYM_V}: Cramer's V.")
 # =========================================================
 # SAYFA 2: GRAFİKLER (OUTLIER YÖNETİMİ VE LOG SCALE EKLENDİ)
 # =========================================================
@@ -1237,9 +1299,22 @@ elif page == "4. Regression":
 
                 target_std = model_data[target_var].std()
 
-                # Model Kurulumu
-                formula = f"{target_var} ~ {' + '.join(predictors)}"
+                # --- DÜZELTME BAŞLANGICI ---
+                # Model Kurulumu (Referansı Zorla)
+                
+                formula_terms = []
+                for p in predictors:
+                    # Eğer değişken "PERIOD" ise, referansı zorla 'Pre' yap
+                    if p == "PERIOD": 
+                        formula_terms.append("C(PERIOD, Treatment(reference='Pre'))")
+                    else:
+                        formula_terms.append(p)
+                
+                # Yeni formülü birleştir
+                formula = f"{target_var} ~ {' + '.join(formula_terms)}"
+                
                 model = smf.ols(formula, data=model_data).fit()
+                # --- DÜZELTME SONU ---
                 
                 target_coef_name = None
                 for name in model.params.index:
@@ -1385,6 +1460,60 @@ elif page == "4. Regression":
                 st.download_button(label="📥 Download Plot (300 DPI)", data=buf.getvalue(), file_name=fname, mime="image/png", use_container_width=True)
         else:
             st.warning("Please click 'Generate Table & Plot' again to update the table structure.")
+    # --- YENİ EKLENEN: PLR > 150 İÇİN LOJİSTİK RİSK ANALİZİ ---
+    if "PLR" in df_f.columns:
+        st.markdown("---")
+        st.header("🧬 Logistic Regression: Risk of High PLR (>150)")
+        
+        # 1. Bağımlı Değişkeni İkilik (Binary) Yap
+        df_f["PLR_HIGH_EVENT"] = (df_f["PLR"] > 150).astype(int)
+
+        # 2. Predictors listesini burada garanti altına alalım
+        # Eğer yukarıda seçilmişse oradan al, yoksa varsayılanları kullan
+        current_main_factor = main_factor if 'main_factor' in locals() else "PERIOD"
+        current_confounders = confounders if 'confounders' in locals() else []
+        
+        local_predictors = [current_main_factor] + current_confounders
+
+        # 3. Formül Terimlerini Hazırla
+        logit_formula_terms = []
+        for p in local_predictors:
+            if p == "PERIOD":
+                logit_formula_terms.append("C(PERIOD, Treatment(reference='Pre'))")
+            else:
+                logit_formula_terms.append(p)
+
+        formula_logit = f"PLR_HIGH_EVENT ~ {' + '.join(logit_formula_terms)}"
+
+        if st.button("Run Logistic Risk Model"):
+            try:
+                # Modeli Kur (Logit)
+                model_logit = smf.logit(formula_logit, data=df_f).fit()
+                
+                # Odds Ratio (OR) ve %95 Güven Aralığı Hesapla
+                or_table = pd.DataFrame({
+                    "Factor": model_logit.params.index,
+                    "Odds Ratio (OR)": np.exp(model_logit.params),
+                    "Lower CI (95%)": np.exp(model_logit.conf_int()[0]),
+                    "Upper CI (95%)": np.exp(model_logit.conf_int()[1]),
+                    "p-value": model_logit.pvalues
+                })
+
+                # Temizlik
+                or_table = or_table[or_table["Factor"] != "Intercept"]
+                
+                st.subheader("📊 Odds Ratios for PLR > 150")
+                st.dataframe(or_table.style.format({
+                    "Odds Ratio (OR)": "{:.2f}",
+                    "Lower CI (95%)": "{:.2f}",
+                    "Upper CI (95%)": "{:.2f}",
+                    "p-value": "{:.3f}"
+                }), use_container_width=True)
+                
+                st.success("Analiz tamamlandı.")
+                
+            except Exception as e:
+                st.error(f"Hata: {e}. Lütfen yukarıdan değişkenlerin seçili olduğundan emin olun.")
 
     # ==========================================
     # ⬇️ 5. DETAYLI MODEL İNCELEMESİ (PRE REFERANS -> POST GÖSTERİMİ) ⬇️
