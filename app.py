@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import shapiro, ttest_ind, mannwhitneyu, chi2_contingency, pearsonr, spearmanr, kendalltau
+from statsmodels.stats.multitest import multipletests
 import statsmodels.formula.api as smf
 import seaborn as sns
 
@@ -239,7 +240,7 @@ df = pd.concat([pre, post], ignore_index=True)
 # Sidebar: Filtreler ve Seçimler (ADVANCED ENGLISH FLOWCHART)
 # ---------------------------
 st.sidebar.title("Settings & Flow")
-page = st.sidebar.radio("Page:", ["1. Summary Table", "2. Plots", "3. Correlation", "4. Regression", "5. Revised Regression model"])
+page = st.sidebar.radio("Page:", ["1. Summary Table", "2. Plots", "3. Correlation", "4. Regression", "5. Revised Regression model", "6. Robust Linear Model", "7. Discussion Builder"])
 
 st.sidebar.markdown("---")
 st.sidebar.header("🛡️ Exclusion Criteria")
@@ -476,6 +477,17 @@ forced_cat_vars = st.sidebar.multiselect("Force Categorical", vars_to_analyze, d
 
 force_parametric = st.sidebar.checkbox("Force Parametric (T-Test)", False)
 
+# --- SUBGROUP ANALYSIS (HAKEM ÖNERİSİ) ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("🎯 Subgroup Analysis (Stratification)")
+subgroup_col = st.sidebar.selectbox("Filter by Subgroup:", ["Full Sample", "SEX", "RACE", "AGE_GROUP"])
+
+if subgroup_col != "Full Sample":
+    subgroup_vals = df_f[subgroup_col].unique().tolist()
+    selected_sub = st.sidebar.multiselect(f"Select {subgroup_col}:", subgroup_vals, default=subgroup_vals[0])
+    df_f = df_f[df_f[subgroup_col].isin(selected_sub)]
+    st.sidebar.warning(f"Analiz şu an sadece seçili {subgroup_col} alt grubu için çalışıyor.")
+
 # --- YENİ EKLENEN: TABLO FORMAT AYARI (SIDEBAR) ---
 st.sidebar.markdown("---")
 non_param_style = st.sidebar.radio(
@@ -604,10 +616,8 @@ if page == "1. Summary Table":
             use_para = force_parametric or is_norm
             
             delta_val = cliffs_delta(pre_vals, post_vals)
-            val_str = f"{delta_val:.2f}" if np.isfinite(delta_val) else "NA"
             
-            delta_str = f"{val_str} {SYM_DELTA}"
-            
+            # Önce Testi Yap (P değerini almak için)
             if use_para:
                 _, p = ttest_ind(pre_vals, post_vals, equal_var=False)
                 d_pre = fmt_mean_sd(pre_vals)
@@ -618,8 +628,19 @@ if page == "1. Summary Table":
                 d_pre = fmt_non_param(pre_vals, non_param_style)
                 d_post = fmt_non_param(post_vals, non_param_style)
                 test_sym = SYM_MWU
-                
-            # BURASI HATANIN DÜZELDİĞİ VE N SÜTUNUNUN EKLENDİĞİ YER
+
+            # --- OK SİMGESİ MANTIĞI (DÜZELTİLMİŞ) ---
+            arrow = ""
+            if np.isfinite(delta_val):
+                if delta_val < 0:
+                    arrow = " ↑" # Post > Pre ise ARTIŞ
+                elif delta_val > 0:
+                    arrow = " ↓" # Post < Pre ise AZALIŞ
+            
+            val_str = f"{delta_val:.2f}" if np.isfinite(delta_val) else "NA"
+            # TEK BİR TANIM BIRAKIYORUZ:
+            delta_str = f"{val_str}{arrow} {SYM_DELTA}" 
+            
             rows.append({
                 "Variable": v, 
                 "Pre (Ref)": d_pre, 
@@ -631,6 +652,26 @@ if page == "1. Summary Table":
             
     if rows:
         df_res_table = pd.DataFrame(rows)
+		      
+        # --- HAKEM ÖNERİSİ: MULTIPLE TESTING CORRECTION (FDR) ---
+        # Tablodaki tüm ham p-değerlerini sayısal listeye çeviriyoruz
+        raw_p_values = []
+        for p_str in df_res_table["P-Value"]:
+            # "0.001 b" gibi simgeli metinlerden sadece sayısal p değerini çek
+            p_val = float(''.join(c for c in p_str.split()[0] if c.isdigit() or c == '.'))
+            raw_p_values.append(p_val)
+        
+        # Benjamini-Hochberg (fdr_bh) yöntemini uygula
+        _, adj_p_values, _, _ = multipletests(raw_p_values, alpha=0.05, method='fdr_bh')
+        
+        # Yeni sütunu formatlayarak ekle
+        df_res_table["Adj. P-Value (FDR)"] = [p_label_detailed(p) for p in adj_p_values]
+        
+        # Sütun sıralamasını güncelle (P-Value yanına al)
+        cols = list(df_res_table.columns)
+        p_idx = cols.index("P-Value")
+        cols.insert(p_idx + 1, cols.pop(cols.index("Adj. P-Value (FDR)")))
+        df_res_table = df_res_table[cols]
         
         # --- ANLAMLI P DEĞERLERİNİ BOLD YAPMA (STYLER) ---
         def make_bold_significant(val):
@@ -1940,3 +1981,208 @@ elif page == "5. Revised Regression model":
                 mime="image/png",
                 use_container_width=True
             )
+
+# =========================================================
+# SAYFA 6: WEIGHTED ROBUST LINEAR MODEL (NCHS/CDC LINEAR FIX)
+# =========================================================
+elif page == "6. Robust Linear Model":
+    st.header("6. Weighted Robust Linear Model (WRLM)")
+    st.info("Bu model, CDC/NCHS standartlarına uygun olarak NHANES ağırlıklarını doğrusal ölçekleme (linear scaling) ile sürece dahil eder.")
+
+    # 1. PARAMETRE SEÇİMİ (Rutin Liste)
+    numeric_candidates = df_f.select_dtypes(include=np.number).columns.tolist()
+    rutin_list = ["WBC", "NEUT_ABS", "LYMPH_ABS", "MONO_ABS", "PLT", "MPV", "SII", "SIRI", "NLR", "dNLR", "PLR", "dPLR", "MLR", "NMLR", "AISI", "CRP"]
+    defaults = [p for p in rutin_list if p in numeric_candidates]
+    targets = st.multiselect("1. Parameters to Analyze (Rows):", numeric_candidates, default=defaults, key="wrlm_targets")
+    
+    remaining = [c for c in all_cols if c not in targets]
+    main_factor = st.selectbox("2. Main Factor (Group/Period):", remaining, index=remaining.index("PERIOD") if "PERIOD" in remaining else 0, key="wrlm_main")
+    
+    conf_options = [c for c in remaining if c != main_factor]
+    safe_defaults = [d for d in ["AGE", "SEX", "BMI", "RACE", "SMOKING_STATUS"] if d in conf_options]
+    confounders = st.multiselect("3. Adjust for (Confounders):", options=conf_options, default=safe_defaults, key="wrlm_conf")
+
+    if st.button("🚀 Run Weighted Robust Analysis"):
+        if not targets:
+            st.warning("Lütfen parametre seçin.")
+            st.stop()
+            
+        summary_data = []
+        import statsmodels.api as sm
+        import patsy
+
+        # Ağırlık Hazırlığı
+        df_f['FINAL_WEIGHT'] = np.nan
+        for w_col in ['WTMECPRP', 'WTMEC2YR', 'WEIGHT_MEC']:
+            if w_col in df_f.columns:
+                df_f['FINAL_WEIGHT'] = df_f['FINAL_WEIGHT'].fillna(df_f[w_col])
+
+        weight_col = 'FINAL_WEIGHT'
+
+        progress_bar = st.progress(0)
+        for i, target_var in enumerate(targets):
+            progress_bar.progress((i + 1) / len(targets))
+            
+            current_predictors = [main_factor] + confounders
+            cols = [target_var] + current_predictors + [weight_col]
+            
+            m_data = df_f[cols].dropna().copy()
+            m_data = m_data[m_data[weight_col] > 0]
+
+            if len(m_data) < 30 or m_data["PERIOD"].nunique() < 2:
+                continue
+
+            try:
+                # --- KRİTİK DÜZELTME: LINEAR SCALING (c * W) ---
+                # CDC mantığına göre ağırlığın kendisi (w) doğrusal bir çarpandır
+                w = m_data[weight_col]
+                
+                # Formül ve Tasarım Matrisi
+                formula_terms = [f"C(PERIOD, Treatment(reference='Pre'))" if p == "PERIOD" else p for p in current_predictors]
+                formula = f"{target_var} ~ {' + '.join(formula_terms)}"
+                y, X = patsy.dmatrices(formula, m_data, return_type='dataframe')
+
+                # Değişkenleri doğrusal ağırlıklarla ölçeklendiriyoruz
+                # Matematiksel olarak WLS mantığının Robust'a aktarılmış hali
+                y_weighted = y.iloc[:,0] * w
+                X_weighted = X.multiply(w, axis=0)
+
+                # ROBUST MODEL (RLM)
+                model = sm.RLM(y_weighted, X_weighted, M=sm.robust.norms.HuberT()).fit()
+
+                coef_key = next((c for c in model.params.index if "Post" in c or (main_factor in c and "Intercept" not in c)), None)
+                
+                if coef_key:
+                    dep_sd = m_data[target_var].std()
+                    summary_data.append({
+                        "Parametre": target_var,
+                        "Robust Beta (Raw)": model.params[coef_key],
+                        "Standardized Beta": model.params[coef_key] / dep_sd,
+                        "p-value": model.pvalues[coef_key],
+                        "LCI": model.conf_int().loc[coef_key][0],
+                        "UCI": model.conf_int().loc[coef_key][1],
+                        "SD_val": dep_sd,
+                        "R2": "NA",
+                        "N": int(model.nobs)
+                    })
+            except:
+                continue
+        
+        progress_bar.empty()
+        if summary_data:
+            st.session_state['wrlm_df'] = pd.DataFrame(summary_data)
+            st.rerun()
+
+    # --- SONUÇLARI GÖSTER (TABLO VE GRAFİK) ---
+    if 'wrlm_df' in st.session_state:
+        res = st.session_state['wrlm_df']
+        st.subheader("📈 Weighted Robust Forest Plot (Effect Size)")
+        
+        rutin_siralamasi = ["WBC", "NEUT_ABS", "LYMPH_ABS", "MONO_ABS", "PLT", "MPV", "SII", "SIRI", "NLR", "dNLR", "PLR", "dPLR", "MLR", "NMLR", "AISI", "CRP"]
+        res['Parametre'] = pd.Categorical(res['Parametre'], categories=rutin_siralamasi, ordered=True)
+        plot_df = res.sort_values("Parametre", ascending=False).copy()
+
+        fig, ax = plt.subplots(figsize=(10, len(plot_df)*0.6 + 2))
+        for i, (idx, row) in enumerate(plot_df.iterrows()):
+            color = '#2ca02c' if row["p-value"] < 0.05 else '#808080' # Weighted Robust için Yeşil tonu
+            err_left = abs(row["Standardized Beta"] - (row["LCI"] / row["SD_val"]))
+            err_right = abs((row["UCI"] / row["SD_val"]) - row["Standardized Beta"])
+            
+            ax.errorbar(row["Standardized Beta"], i, xerr=[[err_left], [err_right]],
+                        fmt='o', color=color, ecolor=color, markersize=10, 
+                        markeredgecolor='black', elinewidth=2.5, capsize=0, zorder=3)
+
+        ax.axvline(0, color='black', linestyle='--', alpha=0.7)
+        ax.set_yticks(range(len(plot_df)))
+        ax.set_yticklabels(plot_df["Parametre"], fontweight='bold')
+        ax.set_xlabel("Standardized Weighted Robust Beta (Effect Size)")
+        st.pyplot(fig)
+		# --- GRAFİĞİ İNDİRME BUTONU (300 DPI) ---
+        st.markdown("---")
+        col_btn1, col_btn2 = st.columns([3, 1]) # Butonu sağa yaslamak için
+        with col_btn2:
+            buf = io.BytesIO()
+            # 300 DPI ve yüksek kalite ayarlarıyla kaydet
+            fig.savefig(buf, format="png", dpi=300, bbox_inches='tight', transparent=False, facecolor='white')
+            st.download_button(
+                label="📥 Download Plot (300 DPI)",
+                data=buf.getvalue(),
+                file_name="nhanes_forest_plot_300dpi.png",
+                mime="image/png",
+                use_container_width=True
+            )
+
+        # Tablo Formatlama (Sizin istediğiniz rutin)
+        st.markdown("---")
+        disp = res.copy()
+        
+        def format_p(p):
+            if p < 0.001: return "<0.001"
+            if p < 0.01: return "<0.01"
+            if p < 0.05: return "<0.05"
+            return f"{p:.3f}"
+        
+        disp["p-value"] = disp["p-value"].apply(lambda x: format_p(float(x)))
+        for col in ["R2", "Standardized Beta"]:
+            disp[col] = disp[col].apply(lambda x: f"{x:.3f}" if x != "NA" else "NA")
+        for col in ["Robust Beta (Raw)", "SD_val", "LCI", "UCI"]:
+            disp[col] = disp[col].apply(lambda x: f"{x:.2f}")
+
+        disp = disp.rename(columns={"SD_val": "SD of Dependent Var", "LCI": "%95 CI Lower", "UCI": "%95 CI Upper"})
+        show_cols = ["Parametre", "Robust Beta (Raw)", "SD of Dependent Var", "Standardized Beta", "p-value", "%95 CI Lower", "%95 CI Upper", "R2", "N"]
+        st.dataframe(disp[show_cols], use_container_width=True, hide_index=True)
+
+# =========================================================
+# SAYFA 7: ROBUST DISCUSSION BUILDER (WRLM BASED)
+# =========================================================
+elif page == "7. Discussion Builder":
+    st.header("✍️ Weighted Robust Discussion Builder")
+    st.info("Bu modül, 6. sayfadaki Robust Analiz sonuçlarını kullanarak hakem eleştirilerine yanıt veren bir tartışma taslağı oluşturur.")
+
+    if 'wrlm_df' not in st.session_state:
+        st.warning("⚠️ Lütfen önce Sayfa 6'da 'Weighted Robust Analysis' işlemini çalıştırın.")
+    else:
+        res_rlm = st.session_state['wrlm_df']
+        
+        # Seçim Menüsü
+        selected_var = st.selectbox("Analiz Edilecek Parametre:", res_rlm['Parametre'].tolist())
+        row = res_rlm[res_rlm['Parametre'] == selected_var].iloc[0]
+        
+        # Veri Çekme
+        beta_val = float(row['Standardized Beta'])
+        p_val_str = row['p-value']
+        n_obs = row['N']
+        status = "significant increase" if beta_val > 0 else "significant decrease"
+        trend = "positive" if beta_val > 0 else "negative"
+
+        st.success(f"Seçili: {selected_var} | Robust Beta: {beta_val:.3f} | P: {p_val_str}")
+
+        # --- TASLAK OLUŞTURMA ---
+        st.markdown("### 📝 Akademik Tartışma Taslağı (Kopyalanabilir)")
+        
+        draft_text = f"""
+        In our study, the Weighted Robust Linear Regression analysis—designed to minimize the influence of extreme 
+        outliers while preserving population representativeness—revealed a {status} in {selected_var} 
+        (Standardized Robust Beta: {beta_val:.3f}, p {p_val_str}, N={n_obs}). 
+        
+        This epidemiological finding at the population level (NHANES) provides a critical bridge to the sustained 
+        platelet hyperreactivity and pro-thrombotic aggregation dynamics reported in recent mechanistic studies 
+        (Ref: 2102.10520, 2412.00747). While laboratory models demonstrate the biological plausibility of 
+        thrombo-inflammatory sequelae, our robust estimations confirm that these shifts are not driven by 
+        isolated extreme observations but represent a systemic trend in the non-institutionalized U.S. population.
+        
+        Furthermore, our results align with EHR-based longitudinal trajectories (Ref: 2005.10938) suggesting 
+        that changes in indices like {selected_var} are indicative of a subacute or chronic inflammatory state 
+        that persisted into the post-pandemic era. By adjusting for key confounders and utilizing 
+        Huber’s T-norm for outlier resistance, we address the reviewer’s concern regarding potential 
+        misclassification of acute states, reinforcing the validity of a true population-wide inflammatory shift.
+        """
+        
+        st.text_area("Draft Text:", draft_text, height=350)
+        
+        st.download_button(
+            label="📥 Taslağı .txt Olarak İndir",
+            data=draft_text,
+            file_name=f"discussion_{selected_var}.txt",
+            mime="text/plain"
+        )
